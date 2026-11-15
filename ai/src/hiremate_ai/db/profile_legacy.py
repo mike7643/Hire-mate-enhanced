@@ -1,10 +1,15 @@
 """그래프로 옮기기 전의 지원자 프로필 테이블 (ai.candidate_profiles, ai.profile_items).
 
 지원자 프로필은 그래프(db.profile, db.profile_store)에 저장한다. 이 테이블은 이미 쌓인 프로필을
-scripts/profile_graph_load.py(copy_legacy_profiles)로 그래프에 옮길 때만 읽는다. 앱은 여기에 쓰지 않는다.
-옮긴 결과를 확인한 뒤 테이블과 이 모듈을 함께 지운다.
+그래프에 옮길 때만 읽는다. 앱은 여기에 쓰지 않는다. 옮긴 결과를 확인한 뒤 테이블과 이 모듈을 함께 지운다.
+
+옮기기 (ai 폴더에서, 운영은 ai 컨테이너에서): uv run python -m hiremate_ai.db.profile_legacy
+DB 주소는 DATABASE_URL, 그래프는 GRAPH_URI, GRAPH_USER, GRAPH_PASSWORD를 쓴다.
+테이블은 바꾸지 않는다. 그래프에 이미 있는 프로필은 그래프에 없는 Agent, 전형의 항목만 채우므로
+다시 실행해도 결과가 같고, 옮긴 뒤 새로 분석한 결과를 덮어쓰지 않는다.
 """
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -15,8 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from hiremate_ai.db.base import SCHEMA, Base
+from hiremate_ai.db.graph import graph_driver
 from hiremate_ai.db.profile import CandidateProfile, ProfileItem
 from hiremate_ai.db.profile_store import import_profile
+from hiremate_ai.db.session import session_factory
 
 
 class LegacyCandidateProfile(Base):
@@ -112,3 +119,22 @@ async def copy_legacy_profiles(session: AsyncSession, graph: AsyncDriver) -> Cop
             ),
         )
     return CopyResult(profiles=len(profiles), items=copied, skipped_items=total - copied)
+
+
+async def _copy() -> CopyResult:
+    graph = graph_driver()
+    try:
+        async with session_factory()() as session:
+            return await copy_legacy_profiles(session, graph)
+    finally:
+        await graph.close()
+
+
+def main() -> None:
+    result = asyncio.run(_copy())
+    print(f"프로필 {result.profiles}개, 옮긴 항목 {result.items}개")
+    print(f"그래프에 이미 있어 건너뛴 항목 {result.skipped_items}개")
+
+
+if __name__ == "__main__":
+    main()
