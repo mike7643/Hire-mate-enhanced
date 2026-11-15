@@ -218,8 +218,12 @@ src/hiremate_ai/
 - 설정은 `config.py`의 `settings`로만 읽는다. `os.environ`을 직접 쓰지 않는다.
 - 함수에는 타입 힌트를 단다. mypy가 검사한다.
 - 테이블은 `ai` 스키마에 둔다. backend가 Flyway로 관리하는 `public` 스키마에는 쓰지 않는다. 마이그레이션은 Alembic으로 한다.
-- 지원자 프로필은 그래프(Neo4j)에 둔다. 모양은 `ApplicationProfile → Claim → Evidence → Source`이고 기술, 도메인 항목은
-  기업마다 따로 둔 `Skill`, `Domain` 노드를 가리킨다(`db/profile.py`). 호출 로그, 대화방, 분석 원본, 문서 색인, NCS는
+- 지원자 프로필은 그래프(Neo4j)에 둔다. 모양은 `ApplicationProfile → Claim → Evidence → Source`이고, 항목(`Claim`)은
+  그 지원서의 회사, 프로젝트(`Experience`)와 기업마다 따로 둔 기술, 업무 분야(`Skill`, `Domain`) 노드를 가리킨다
+  (`db/profile.py`). 항목에는 수행 주체(actor)와 한 일의 종류(action)를 적는다. 이 값들은 서류 분석의 사실 추출이 내고
+  (`extract.py`), 회사, 프로젝트 이름은 그 서류에, 기술 이름은 근거 문장에 적힌 것만 남긴다. 업무 분야는 모델이 근거
+  문장으로 분류한 값이다. 코드에 기술, 분야 이름 목록을 두지 않는다. 이름은 대소문자와 공백만 무시해 같은 노드로 보고,
+  표기가 다른 같은 이름(카프카와 Kafka)은 합치지 않는다. 호출 로그, 대화방, 분석 원본, 문서 색인, NCS는
   PostgreSQL에 남는다. 그래프를 읽고 쓰는 Cypher는 `db/profile_store.py`에만 두고, 다른 코드는 그 함수
   (`save_profile`, `load_profiles` 등)를 부른다. 조회는 기업, 채용 범위를 조건으로 건다 (규칙 4).
   드라이버는 `db.graph`의 `graph_driver()`로 얻고 라우터는 `GraphDep`으로 받는다. 제약과 색인은 리비전 없이

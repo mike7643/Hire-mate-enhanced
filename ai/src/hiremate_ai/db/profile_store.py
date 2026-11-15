@@ -89,7 +89,7 @@ CREATE (p)-[:HAS_CLAIM]->(c:Claim {
     id: item.id, category: item.category, agent: item.agent, content: item.content,
     verification: item.verification, seq: item.seq, createdAt: item.createdAt
 })
-SET c.stageId = item.stageId
+SET c.stageId = item.stageId, c.actor = item.actor, c.action = item.action
 MERGE (s:Source {key: item.sourceKey})
 ON CREATE SET s.applicationId = $applicationId, s.companyId = p.companyId, s.recruitmentId = p.recruitmentId,
               s.kind = item.source, s.stageId = item.stageId
@@ -97,21 +97,33 @@ FOREACH (_ IN CASE WHEN item.evidence IS NULL THEN [] ELSE [1] END |
     CREATE (c)-[:SUPPORTED_BY]->(:Evidence {id: item.evidenceId, quote: item.evidence})-[:FROM_SOURCE]->(s))
 FOREACH (_ IN CASE WHEN item.evidence IS NULL THEN [1] ELSE [] END |
     CREATE (c)-[:FROM_SOURCE]->(s))
-FOREACH (_ IN CASE WHEN item.category = 'SKILL' THEN [1] ELSE [] END |
-    MERGE (k:Skill {key: item.conceptKey})
-    ON CREATE SET k.companyId = p.companyId, k.name = item.content
+FOREACH (_ IN CASE WHEN item.experience IS NULL THEN [] ELSE [1] END |
+    MERGE (x:Experience {key: item.experienceKey})
+    ON CREATE SET x.applicationId = $applicationId, x.companyId = p.companyId, x.recruitmentId = p.recruitmentId,
+                  x.title = item.experience
+    MERGE (p)-[:HAS_EXPERIENCE]->(x)
+    CREATE (c)-[:ABOUT_EXPERIENCE]->(x))
+FOREACH (skill IN item.skills |
+    MERGE (k:Skill {key: skill.key})
+    ON CREATE SET k.companyId = p.companyId, k.name = skill.name
     CREATE (c)-[:USES_SKILL]->(k))
-FOREACH (_ IN CASE WHEN item.category = 'DOMAIN' THEN [1] ELSE [] END |
-    MERGE (d:Domain {key: item.conceptKey})
-    ON CREATE SET d.companyId = p.companyId, d.name = item.content
+FOREACH (domain IN item.domains |
+    MERGE (d:Domain {key: domain.key})
+    ON CREATE SET d.companyId = p.companyId, d.name = domain.name
     CREATE (c)-[:IN_DOMAIN]->(d))
 """
 
-# 항목이 모두 빠진 자료 노드는 남기지 않는다
+# 항목이 모두 빠진 자료 노드와 경험 노드는 남기지 않는다
 _DELETE_UNUSED_SOURCES = """
 MATCH (s:Source {applicationId: $applicationId})
 WHERE NOT (s)<-[:FROM_SOURCE]-()
 DELETE s
+"""
+
+_DELETE_UNUSED_EXPERIENCES = """
+MATCH (x:Experience {applicationId: $applicationId})
+WHERE NOT (x)<-[:ABOUT_EXPERIENCE]-()
+DETACH DELETE x
 """
 
 _LOAD = """
@@ -124,7 +136,11 @@ WITH p, c, e, coalesce(quoted, stated) AS s
 ORDER BY c.createdAt, c.seq
 RETURN p AS profile, collect(CASE WHEN c IS NULL THEN null ELSE {
     id: c.id, category: c.category, agent: c.agent, content: c.content, verification: c.verification,
-    stageId: c.stageId, createdAt: c.createdAt, evidence: e.quote, source: s.kind
+    stageId: c.stageId, createdAt: c.createdAt, evidence: e.quote, source: s.kind,
+    actor: c.actor, action: c.action,
+    experience: head([(c)-[:ABOUT_EXPERIENCE]->(x:Experience) | x.title]),
+    skills: [(c)-[:USES_SKILL]->(k:Skill) | k.name],
+    domains: [(c)-[:IN_DOMAIN]->(d:Domain) | d.name]
 } END) AS items
 """
 
@@ -160,6 +176,12 @@ class NewItem(_Input):
     source: str  # 출처 (이력서, 자기소개서, 평가 결과, 면접 답변 등)
     # 확인 상태. 평가 · 면접 분석이 확인됨 · 상충을 알 때 넘긴다. 비우면 근거 문장으로 정한다
     verification: Verification | None = None
+    # 항목끼리 잇는 값. 분석 Agent가 원문에서 확인한 것만 넘긴다. 이 모듈은 이름을 고치거나 채우지 않는다
+    experience: str | None = None  # 이 항목이 속한 회사 · 프로젝트 이름
+    actor: str | None = None  # 수행 주체 (SELF, TEAM, UNCLEAR)
+    action: str | None = None  # 한 일의 종류 (DEVELOP, OPERATE 등)
+    skills: tuple[str, ...] = ()  # 항목에 나온 기술 · 도구 이름
+    domains: tuple[str, ...] = ()  # 항목의 업무 분야
 
 
 class ProfileScopeError(ValueError):
@@ -204,6 +226,11 @@ async def save_profile(
             source=item.source,
             stage_id=stage_id,
             created_at=now,
+            experience=item.experience,
+            actor=item.actor,
+            action=item.action,
+            skills=item.skills,
+            domains=item.domains,
         )
         for seq, item in enumerate(checked)
     ]
@@ -230,6 +257,7 @@ async def save_profile(
         if rows:
             await tx.run(_CREATE_CLAIMS, applicationId=str(application_id), items=rows)
         await tx.run(_DELETE_UNUSED_SOURCES, applicationId=str(application_id))
+        await tx.run(_DELETE_UNUSED_EXPERIENCES, applicationId=str(application_id))
 
     await ensure_schema(graph)
     async with graph.session() as session:
@@ -283,6 +311,11 @@ async def import_profile(graph: AsyncDriver, profile: CandidateProfile) -> int:
                 source=item.source,
                 stage_id=item.stage_id,
                 created_at=item.created_at,
+                experience=item.experience,
+                actor=item.actor,
+                action=item.action,
+                skills=item.skills,
+                domains=item.domains,
             )
             for seq, item in enumerate(profile.items)
             if (str(item.agent), str(item.stage_id) if item.stage_id is not None else None) not in groups
@@ -367,6 +400,11 @@ def _claim_row(
     source: str,
     stage_id: UUID | None,
     created_at: datetime,
+    experience: str | None,
+    actor: str | None,
+    action: str | None,
+    skills: Sequence[str],
+    domains: Sequence[str],
 ) -> dict[str, Any]:
     """항목 한 줄을 Cypher 매개변수로 바꾼다.
 
@@ -383,11 +421,31 @@ def _claim_row(
         "verification": str(verification),
         "source": source,
         "sourceKey": f"{application_id}|{stage or ''}|{source}",
-        "conceptKey": f"{company_id}|{' '.join(content.casefold().split())}",
+        "experience": experience,
+        "experienceKey": f"{application_id}|{_name_key(experience)}" if experience else None,
+        "actor": actor,
+        "action": action,
+        "skills": _concepts(company_id, skills),
+        "domains": _concepts(company_id, domains),
         "stageId": stage,
         "seq": seq,
         "createdAt": created_at,
     }
+
+
+def _name_key(name: str) -> str:
+    """같은 이름인지 가르는 값. 대소문자와 공백만 무시한다. 표기가 다른 같은 이름은 합치지 않는다."""
+    return "".join(name.casefold().split())
+
+
+def _concepts(company_id: UUID, names: Sequence[str]) -> list[dict[str, str]]:
+    """기술 · 업무 분야 이름을 기업별 노드 키와 함께. 같은 이름은 한 번만 넣는다."""
+    found: dict[str, str] = {}
+    for name in names:
+        key = _name_key(name)
+        if key:
+            found.setdefault(f"{company_id}|{key}", name.strip())
+    return [{"key": key, "name": name} for key, name in found.items()]
 
 
 def _profile(record: Mapping[str, Any]) -> CandidateProfile:
@@ -413,6 +471,11 @@ def _profile(record: Mapping[str, Any]) -> CandidateProfile:
                 source=item["source"],
                 stage_id=UUID(item["stageId"]) if item["stageId"] else None,
                 created_at=item["createdAt"].to_native(),
+                experience=item["experience"],
+                actor=item["actor"],
+                action=item["action"],
+                skills=tuple(sorted(item["skills"])),
+                domains=tuple(sorted(item["domains"])),
             )
             for item in record["items"]
         ],

@@ -21,6 +21,7 @@ _SCHEMA = (
     "CREATE CONSTRAINT claim_id IF NOT EXISTS FOR (c:Claim) REQUIRE c.id IS UNIQUE",
     "CREATE CONSTRAINT evidence_id IF NOT EXISTS FOR (e:Evidence) REQUIRE e.id IS UNIQUE",
     "CREATE CONSTRAINT source_key IF NOT EXISTS FOR (s:Source) REQUIRE s.key IS UNIQUE",
+    "CREATE CONSTRAINT experience_key IF NOT EXISTS FOR (x:Experience) REQUIRE x.key IS UNIQUE",
     "CREATE CONSTRAINT skill_key IF NOT EXISTS FOR (k:Skill) REQUIRE k.key IS UNIQUE",
     "CREATE CONSTRAINT domain_key IF NOT EXISTS FOR (d:Domain) REQUIRE d.key IS UNIQUE",
     "CREATE INDEX application_profile_scope IF NOT EXISTS FOR (p:ApplicationProfile) ON (p.companyId, p.recruitmentId)",

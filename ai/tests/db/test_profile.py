@@ -28,6 +28,7 @@ async def test_schema_is_created_once_and_can_run_again(graph: AsyncDriver) -> N
         "claim_id",
         "evidence_id",
         "source_key",
+        "experience_key",
         "skill_key",
         "domain_key",
     }
