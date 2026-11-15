@@ -38,6 +38,27 @@ def test_team_and_unclear_facts_are_saved_unconfirmed() -> None:
     }
 
 
+def test_profile_items_carry_experience_actor_skills_and_domains() -> None:
+    linked = fact("결제 API를 개발했다", Actor.SELF).model_copy(
+        update={"experience": "한빛카드", "action": "DEVELOP", "skills": ["Java"], "domains": ["금융"]}
+    )
+    review = ApplicationReview(
+        version="test",
+        input_hash="hash",
+        application_id=uuid4(),
+        readable=True,
+        facts=[linked, fact("팀이 정산 DB를 이관했다", Actor.TEAM)],
+    )
+
+    _, items = to_profile(review)
+
+    first, second = (item for item in items if item.category is ItemCategory.EXPERIENCE)
+    assert (first.experience, first.actor, first.action) == ("한빛카드", "SELF", "DEVELOP")
+    assert (first.skills, first.domains) == (("Java",), ("금융",))
+    # 값이 없는 사실은 비워 둔다. 수행 주체는 언제나 넘긴다
+    assert (second.experience, second.actor, second.action, second.skills) == (None, "TEAM", None, ())
+
+
 def test_profile_items_use_plain_style() -> None:
     # 모델이 존댓말로 써도 프로필 항목은 평어(~다)로 저장한다
     review = ApplicationReview(

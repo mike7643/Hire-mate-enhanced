@@ -192,6 +192,11 @@ def to_profile(review: ApplicationReview) -> tuple[ProfileFields, list[NewItem]]
             evidence=fact.quotes[0].sentence,
             source=fact.quotes[0].document.label,
             verification=None if fact.actor is Actor.SELF else Verification.UNCONFIRMED,
+            experience=fact.experience or None,
+            actor=fact.actor.value,
+            action=fact.action or None,
+            skills=tuple(fact.skills),
+            domains=tuple(fact.domains),
         )
         for fact in review.facts
         if fact.supported and fact.kind in ("SKILL", "EXPERIENCE", "PROJECT", "ACHIEVEMENT")
