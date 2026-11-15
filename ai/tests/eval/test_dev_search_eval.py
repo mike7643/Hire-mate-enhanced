@@ -10,6 +10,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
+from neo4j import AsyncDriver
 from root_context import make_context, sessions_of
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,13 +110,13 @@ def dev_context(
     return context.model_copy(update={"candidates": rows, "documents": documents})
 
 
-async def seed_profiles(session: AsyncSession, context: ChatContext) -> None:
+async def seed_profiles(graph: AsyncDriver, context: ChatContext) -> None:
     ids = {row.name: row.application_id for row in context.candidates}
     for candidate in DATA["candidates"]:
         if not candidate["profile"]:
             continue
         await save_profile(
-            session,
+            graph,
             company_id=context.company.company_id,
             recruitment_id=context.recruitment_id,
             application_id=ids[candidate["name"]],
@@ -125,17 +126,17 @@ async def seed_profiles(session: AsyncSession, context: ChatContext) -> None:
             ),
             items=[NewItem.model_validate(item) for item in candidate["profile"]],
         )
-    await session.commit()
 
 
 async def test_dev_search_candidates_are_repeatable(
     db_session: AsyncSession,
+    graph: AsyncDriver,
     sample_applicants: dict[str, ApplicantDetail],
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
 ) -> None:
     context = dev_context(sample_applicants, sample_company, sample_posting, "결제 경험")
-    await seed_profiles(db_session, context)
+    await seed_profiles(graph, context)
     toolkit = profile_toolkit(sessions_of(db_session))
     scope = scope_of(context)
     pool = [row.application_id for row in context.candidates]
@@ -167,12 +168,13 @@ def capture_search(
 @pytest.mark.skipif(not settings.llm_eval, reason="LLM_EVAL=true일 때 실제 모델로 평가한다")
 async def test_dev_search_with_real_model(
     db_session: AsyncSession,
+    graph: AsyncDriver,
     sample_applicants: dict[str, ApplicantDetail],
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
 ) -> None:
     context = dev_context(sample_applicants, sample_company, sample_posting, "")
-    await seed_profiles(db_session, context)
+    await seed_profiles(graph, context)
     names = {row.application_id: row.name for row in context.candidates}
     llm = build_llm(CountingLog())
     print("\n| 사례 | 반복 | 검색 조건 | 후보 순서 | 결과 | 확인 대상 누락 | 확인 대상 오탐 | 시간(초) |")

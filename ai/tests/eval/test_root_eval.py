@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from neo4j import AsyncDriver
 from root_context import SAMPLE_PROFILES, extra_row, make_context, save_sample_profiles
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -122,6 +123,7 @@ def failures(plan: ChatPlan, expect: dict[str, Any], context: ChatContext) -> li
 
 async def test_root_cases(
     database_url: str,
+    graph: AsyncDriver,
     sample_applicants: Applicants,
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
@@ -129,9 +131,7 @@ async def test_root_cases(
     # 앱처럼 연결 풀을 쓴다. 분석 루프가 도구를 함께 부르면 연결도 따로 쓴다
     engine = create_async_engine(database_url)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
-    async with sessions() as session:
-        await save_sample_profiles(session, sample_company, sample_applicants)
-        await session.commit()
+    await save_sample_profiles(graph, sample_company, sample_applicants)
     rows: list[tuple[str, bool, int, float, str, str]] = []
     for case in CASES:
         log = CountingLog()

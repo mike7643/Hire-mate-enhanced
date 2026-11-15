@@ -12,10 +12,11 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import Depends
+from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hiremate_ai.agents.analysis.application.present import CATEGORY_LABEL
-from hiremate_ai.agents.analysis.application.store import DbReviewStore
+from hiremate_ai.agents.analysis.application.store import DbReviewStore, Sessions
 from hiremate_ai.agents.analysis.application.types import VERDICT_LABEL, Actor, ApplicationReview, Verdict
 from hiremate_ai.agents.root.ledger import (
     COMPANY_SOURCE,
@@ -33,6 +34,7 @@ from hiremate_ai.agents.root.types import CandidateRow, ChatContext, Decision, S
 from hiremate_ai.config import settings
 from hiremate_ai.contract import InterviewQuestion, StageType
 from hiremate_ai.db.analysis_store import AnalysisArtifactReader, DbAnalysisArtifacts
+from hiremate_ai.db.graph import graph_driver
 from hiremate_ai.db.profile import ItemAgent, ItemCategory, Verification
 from hiremate_ai.db.session import session_factory
 from hiremate_ai.llm.prompt import data_block
@@ -40,12 +42,7 @@ from hiremate_ai.ncs_search.reference import NcsReference, get_ncs
 from hiremate_ai.tools.candidates import CandidateMatch, CandidateSearch, SearchResults, SourcedSentence
 from hiremate_ai.tools.document_search import document_embedding_search
 from hiremate_ai.tools.embedding import Embedder, get_embedder
-from hiremate_ai.tools.profile_lookup import (
-    Sessions,
-    ordered_items,
-    profile_front,
-    read_profile,
-)
+from hiremate_ai.tools.profile_lookup import ordered_items, profile_front, read_profile
 from hiremate_ai.tools.profile_search import profile_search
 from hiremate_ai.tools.scope import ToolScope
 
@@ -401,7 +398,7 @@ async def no_profile_evidence(
     return {}
 
 
-def profile_evidence(sessions: Sessions) -> ProfileEvidence:
+def profile_evidence(graph: AsyncDriver) -> ProfileEvidence:
     """지원자들의 프로필 항목 가운데 근거 문장이 있는 것을 만든 Agent, 확인 상태와 함께 읽는다.
 
     범위 밖 지원자는 읽지 않는다.
@@ -409,17 +406,16 @@ def profile_evidence(sessions: Sessions) -> ProfileEvidence:
 
     async def evidence(scope: RootToolContext, application_ids: Sequence[UUID]) -> dict[UUID, list[AgentEvidence]]:
         found: dict[UUID, list[AgentEvidence]] = {}
-        async with sessions() as session:
-            for application_id in dict.fromkeys(application_ids):
-                profile = await read_profile(session, scope, application_id)
-                if profile is not None:
-                    found[application_id] = [
-                        AgentEvidence(
-                            sentence=item.evidence, source=item.source, agent=item.agent, verification=item.verification
-                        )
-                        for item in profile.items
-                        if item.evidence
-                    ]
+        for application_id in dict.fromkeys(application_ids):
+            profile = await read_profile(graph, scope, application_id)
+            if profile is not None:
+                found[application_id] = [
+                    AgentEvidence(
+                        sentence=item.evidence, source=item.source, agent=item.agent, verification=item.verification
+                    )
+                    for item in profile.items
+                    if item.evidence
+                ]
         return found
 
     return evidence
@@ -492,19 +488,18 @@ async def no_review(scope: RootToolContext, application_id: UUID) -> Application
     return None
 
 
-def db_profile_reader(sessions: Sessions) -> ProfileReader:
+def db_profile_reader(graph: AsyncDriver) -> ProfileReader:
     """AI 워커의 분석 Agent들이 저장한 지원자 프로필을 읽는다. 범위 밖 지원자는 읽지 않는다."""
 
     async def read(scope: RootToolContext, application_id: UUID) -> ProfileView | None:
-        async with sessions() as session:
-            profile = await read_profile(session, scope, application_id)
-            if profile is None:
-                return None
-            lines = [
-                ProfileLine(item.category, item.content, item.evidence, item.source, item.verification, item.agent)
-                for item in ordered_items(profile)
-            ]
-            return ProfileView(front=profile_front(profile), lines=lines)
+        profile = await read_profile(graph, scope, application_id)
+        if profile is None:
+            return None
+        lines = [
+            ProfileLine(item.category, item.content, item.evidence, item.source, item.verification, item.agent)
+            for item in ordered_items(profile)
+        ]
+        return ProfileView(front=profile_front(profile), lines=lines)
 
     return read
 
@@ -718,21 +713,24 @@ def default_toolkit() -> RootToolkit:
     return RootToolkit(search=keyword_search)
 
 
-def profile_toolkit(sessions: async_sessionmaker[AsyncSession], *, embedder: Embedder | None = None) -> RootToolkit:
-    """지원자 프로필을 함께 쓰는 묶음.
+def profile_toolkit(
+    sessions: async_sessionmaker[AsyncSession], *, embedder: Embedder | None = None, graph: AsyncDriver | None = None
+) -> RootToolkit:
+    """지원자 프로필을 함께 쓰는 묶음. graph는 프로필 그래프다. 비우면 설정의 그래프(graph_driver)를 쓴다.
 
     찾기는 프로필 문장을 먼저 쓰고, 모자라거나 프로필이 없으면 제출 문서 문장으로 채운다.
     답 근거는 분석 Agent가 프로필에 남긴 근거와도 맞춰 본다 (평가 제출물처럼 ChatContext에 원문이 없는 자료).
     """
-    searches = [profile_search(sessions, terms=concept_terms), keyword_search]
+    graph = graph or graph_driver()
+    searches = [profile_search(graph, terms=concept_terms), keyword_search]
     if embedder is not None:
         searches.append(document_embedding_search(sessions, embedder, model=settings.ncs_model))
     search = merged_search(*searches)
     return RootToolkit(
         search=search,
-        evidence=profile_evidence(sessions),
-        artifacts=DbAnalysisArtifacts(sessions),
-        profile=db_profile_reader(sessions),
+        evidence=profile_evidence(graph),
+        artifacts=DbAnalysisArtifacts(sessions, graph=graph),
+        profile=db_profile_reader(graph),
         review=db_review_reader(sessions),
     )
 

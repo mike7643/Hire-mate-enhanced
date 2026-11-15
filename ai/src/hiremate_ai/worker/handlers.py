@@ -8,6 +8,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hiremate_ai.agents.analysis.application import analyze_application, index_document, normalize_document
@@ -23,6 +24,7 @@ from hiremate_ai.agents.generation.report.enrich import DbStageItems
 from hiremate_ai.api import assessment, interview, report
 from hiremate_ai.config import settings
 from hiremate_ai.contract import DocumentIndexRequest, DocumentNormalizationRequest
+from hiremate_ai.db.graph import graph_driver
 from hiremate_ai.db.profile_store import ProfileScopeError
 from hiremate_ai.llm.batch_state import current_batch_job
 from hiremate_ai.llm.client import LlmClient
@@ -44,10 +46,12 @@ def job_handlers(
     application_llm: LlmClient | None = None,
     normalization_llm_factory: Callable[[], LlmClient] | None = None,
     document_embedder: Embedder | None = None,
+    graph: AsyncDriver | None = None,
 ) -> Mapping[str, Handler]:
     """워커가 처리하는 작업 유형. 자료가 들어오거나 전형이 시작될 때 미리 돌리는 분석 · 생성과 리포트를 둔다.
 
     Chat과 화면에서 기다리는 요청은 워커를 거치지 않고 ai 서버 경로로 바로 받는다.
+    graph는 지원자 프로필 그래프다. 비우면 설정의 그래프(graph_driver)를 쓴다.
     """
 
     # 지원서 하나의 분석 시간 한도는 기술 오류로 다시 시도한 시간까지 합친다 (시도마다 새로 주지 않는다)
@@ -88,7 +92,7 @@ def job_handlers(
         request = assessment.AnalyzeRequest.model_validate(payload)
         async with sessions() as session:
             try:
-                result = await assessment.analyze_and_save(request.input, llm, session)
+                result = await assessment.analyze_and_save(request.input, llm, session, graph or graph_driver())
             except ProfileScopeError as error:
                 raise PermanentError(str(error)) from error
         return result.model_dump(mode="json")
@@ -97,7 +101,7 @@ def job_handlers(
         request = interview.AnalyzeRequest.model_validate(payload)
         async with sessions() as session:
             try:
-                result = await interview.analyze_and_save(request.input, llm, session)
+                result = await interview.analyze_and_save(request.input, llm, session, graph or graph_driver())
             except ProfileScopeError as error:
                 raise PermanentError(str(error)) from error
         return result.model_dump(mode="json")
@@ -105,7 +109,7 @@ def job_handlers(
     async def report_compose(payload: dict[str, Any]) -> dict[str, Any]:
         # 전형 결과 · 지원자 비교 · 최종 리포트. backend가 만든 묶음만 읽고 DB를 조회하지 않는다
         request = report.ComposeRequest.model_validate(payload)
-        bundle = await enrich(request.bundle, store, DbStageItems(sessions))
+        bundle = await enrich(request.bundle, store, DbStageItems(graph or graph_driver()))
         return (await compose_report(bundle, llm)).model_dump(mode="json")
 
     async def interview_questions(payload: dict[str, Any]) -> dict[str, Any]:

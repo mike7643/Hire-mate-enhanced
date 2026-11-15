@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = SecretStr("")
 
     database_url: str = "postgresql+psycopg://hiremate:hiremate@localhost:5432/hiremate"
+    # 지원자 프로필 그래프(Neo4j). 내부망에만 연다
+    graph_uri: str = "bolt://localhost:7687"
+    graph_user: str = "neo4j"
+    graph_password: SecretStr = SecretStr("hiremate-local")
     redis_url: str = "redis://localhost:6379/0"
     backend_base_url: str = "http://localhost:8080"
     # OpenAI 호환 API 주소와 모델. 모델이 비어 있으면 LLM을 부르지 않는다

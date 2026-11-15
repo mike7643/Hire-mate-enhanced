@@ -1,8 +1,10 @@
 from fastapi import APIRouter, HTTPException
+from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hiremate_ai.agents.analysis.assessment import AssessmentInput, analyze_assessment
 from hiremate_ai.contract import ContractModel
+from hiremate_ai.db.graph import GraphDep
 from hiremate_ai.db.profile import ItemAgent, ProfileStatus
 from hiremate_ai.db.profile_store import ProfileScopeError, save_profile
 from hiremate_ai.db.session import SessionDep
@@ -32,7 +34,9 @@ class AssessmentAnalysisError(RuntimeError):
     """모델이 끝내 형식에 맞는 답을 내지 못했다. 이전 분석을 지우지 않도록 저장하지 않는다. 워커는 다시 시도한다."""
 
 
-async def analyze_and_save(data: AssessmentInput, llm: LlmClient, session: AsyncSession) -> AnalyzeResult:
+async def analyze_and_save(
+    data: AssessmentInput, llm: LlmClient, session: AsyncSession, graph: AsyncDriver
+) -> AnalyzeResult:
     """평가 자료를 분석해 지원자 프로필에 저장한다. ai 서버 경로와 AI 워커가 같이 쓴다.
 
     다른 기업 · 채용의 프로필이면 ProfileScopeError다 (아키텍처 규칙 4).
@@ -43,7 +47,7 @@ async def analyze_and_save(data: AssessmentInput, llm: LlmClient, session: Async
     if analysis.status is ProfileStatus.FAILED:
         raise AssessmentAnalysisError(f"지원서 {data.application_id}의 평가 자료를 분석하지 못했다")
     profile = await save_profile(
-        session,
+        graph,
         company_id=data.company_id,
         recruitment_id=data.recruitment_id,
         application_id=data.application_id,
@@ -57,9 +61,9 @@ async def analyze_and_save(data: AssessmentInput, llm: LlmClient, session: Async
 
 
 @router.post("/analyze")
-async def analyze(request: AnalyzeRequest, llm: LlmDep, session: SessionDep) -> AnalyzeResult:
+async def analyze(request: AnalyzeRequest, llm: LlmDep, session: SessionDep, graph: GraphDep) -> AnalyzeResult:
     try:
-        return await analyze_and_save(request.input, llm, session)
+        return await analyze_and_save(request.input, llm, session, graph)
     except ProfileScopeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except AssessmentAnalysisError as error:

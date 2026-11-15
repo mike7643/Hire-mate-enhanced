@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from neo4j import AsyncDriver
 from pydantic import BaseModel, TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -47,7 +48,7 @@ SAMPLE_PROFILES = TypeAdapter(list[SampleProfile]).validate_json((SAMPLES_DIR / 
 
 
 async def save_sample_profiles(
-    session: AsyncSession,
+    graph: AsyncDriver,
     company: CompanyProfile,
     applicants: dict[str, ApplicantDetail],
     names: Sequence[str] | None = None,
@@ -58,7 +59,7 @@ async def save_sample_profiles(
             continue
         applicant = applicants[sample.name]
         await save_profile(
-            session,
+            graph,
             company_id=company.company_id,
             recruitment_id=applicant.info.recruitment_id,
             application_id=applicant.info.application_id,

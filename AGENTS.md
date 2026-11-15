@@ -50,7 +50,7 @@ AI는 분석, 탐색, 초안 작성을 돕되 채용 결정은 담당자가 직�
 7. 분석과 탐색 결과에는 근거 문장과 출처를 붙인다. 근거가 없는 정보를 사실처럼 채우지 않는다.
 8. `backend/`는 기능별 패키지(모듈)로 나눈다. 의존 방향은 진입(인증, AI 연동) → 업무 → 공통(로그, 파일, 대기열, 메일)이다.
    다른 모듈의 테이블이나 Repository를 직접 쓰지 않고, 그 모듈이 공개한 서비스만 호출한다.
-9. 외부에 공개되는 것은 Nginx뿐이다. AI 서버, DB, Redis는 내부망에 둔다. 지원자 파일은 비공개 S3에 두고 서명 URL로만 연다.
+9. 외부에 공개되는 것은 Nginx뿐이다. AI 서버, DB, 프로필 그래프(Neo4j), Redis는 내부망에 둔다. 지원자 파일은 비공개 S3에 두고 서명 URL로만 연다.
 
 ## 영역별 구조
 
@@ -165,7 +165,7 @@ src/hiremate_ai/
 │       └── report/             최종 리포트 초안
 ├── tools/                      Agent 도구
 ├── llm/                        모델 클라이언트 (LlmClient, 도구 루프 Agent, 테스트용 FakeLlm), 프롬프트 자료 블록, 호출 로그, LangSmith 추적
-├── db/                         ai 스키마 (Base, 세션)
+├── db/                         ai 스키마 (Base, 세션), 지원자 프로필 그래프 (Neo4j 연결, 저장과 조회)
 │   └── migrations/             Alembic 리비전
 ├── ncs_search/                 NCS 참고 검색: 표 적재, pgvector 검색, 질의 임베딩 서비스 (uv run --group ncs python -m hiremate_ai.ncs_search)
 └── worker/                     AI 워커: Redis 작업 대기열 소비자 (uv run python -m hiremate_ai.worker)
@@ -218,6 +218,16 @@ src/hiremate_ai/
 - 설정은 `config.py`의 `settings`로만 읽는다. `os.environ`을 직접 쓰지 않는다.
 - 함수에는 타입 힌트를 단다. mypy가 검사한다.
 - 테이블은 `ai` 스키마에 둔다. backend가 Flyway로 관리하는 `public` 스키마에는 쓰지 않는다. 마이그레이션은 Alembic으로 한다.
+- 지원자 프로필은 그래프(Neo4j)에 둔다. 모양은 `ApplicationProfile → Claim → Evidence → Source`이고 기술, 도메인 항목은
+  기업마다 따로 둔 `Skill`, `Domain` 노드를 가리킨다(`db/profile.py`). 호출 로그, 대화방, 분석 원본, 문서 색인, NCS는
+  PostgreSQL에 남는다. 그래프를 읽고 쓰는 Cypher는 `db/profile_store.py`에만 두고, 다른 코드는 그 함수
+  (`save_profile`, `load_profiles` 등)를 부른다. 조회는 기업, 채용 범위를 조건으로 건다 (규칙 4).
+  드라이버는 `db.graph`의 `graph_driver()`로 얻고 라우터는 `GraphDep`으로 받는다. 제약과 색인은 리비전 없이
+  `ensure_schema`가 처음 저장할 때 만든다. 모델이 쓴 Cypher를 실행하지 않는다.
+- 프로필 저장은 그래프 트랜잭션 하나다. PostgreSQL과 함께 쓰는 곳(분석 원본, 면접 산출물)은 프로필을 먼저 저장하고
+  나서 커밋한다. 같은 Agent, 전형의 재저장은 항목을 통째로 바꾸므로 커밋이 실패해 다시 분석해도 어긋나지 않는다.
+- `ai.candidate_profiles`, `ai.profile_items` 테이블은 그래프로 옮기기 전 자료다(`db/profile_legacy.py`).
+  `scripts/profile_graph_load.py`로 옮길 때만 읽고 앱은 쓰지 않는다.
 - 여러 Agent가 같이 쓰는 backend 타입은 `contract.py`에 있다. 한 Agent만 쓰는 요청, 응답 타입은 그 Agent 패키지 안(라우터 파일, 패키지 안 여러 모듈이 같이 쓰면 `types.py`)에 두고
   공통 타입을 조합한다. 계약 타입을 바꾸면 `contract/`의 샘플도 고친다 (`contract/README.md`).
 - backend 연동 엔드포인트는 `POST /agents/{agent}/{method}`다. 요청 본문은 backend Agent 인터페이스 메서드의
@@ -270,3 +280,4 @@ src/hiremate_ai/
 - 테이블은 `db.base.Base`를 상속해 `db/` 아래 모듈에 둔다. 라우터는 `SessionDep`으로 세션을 받는다.
   리비전은 `uv run alembic revision --autogenerate -m "<설명>"`으로 만들고 헤드를 하나로 유지한다.
   DB 테스트는 `db_session` fixture를 쓴다(Testcontainers, Docker 필요).
+  프로필 그래프를 쓰는 테스트는 `graph` fixture를 받는다(테스트마다 비운 Neo4j). 받지 않으면 그래프 연결이 실패한다.

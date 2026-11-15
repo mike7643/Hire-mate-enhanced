@@ -1,5 +1,6 @@
 from uuid import uuid4
 
+from neo4j import AsyncDriver
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,7 +100,11 @@ async def test_index_route_returns_document_id_and_revision(db_session: AsyncSes
 
 
 async def test_root_toolkit_uses_normalized_document_vectors(
-    db_session: AsyncSession, sample_applicants: dict, sample_company: CompanyProfile, sample_posting: PostingContent
+    db_session: AsyncSession,
+    sample_applicants: dict,
+    sample_company: CompanyProfile,
+    sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
     from root_context import make_context, sessions_of
 
@@ -118,6 +123,7 @@ async def test_root_toolkit_uses_normalized_document_vectors(
 
 
 def test_profile_embeddings_are_no_longer_part_of_runtime() -> None:
+    import dataclasses
     import inspect
 
     from hiremate_ai.agents.analysis.application import router
@@ -126,5 +132,4 @@ def test_profile_embeddings_are_no_longer_part_of_runtime() -> None:
 
     assert "profile_indexer" not in inspect.signature(job_handlers).parameters
     assert "indexer" not in inspect.signature(router.analyze).parameters
-    assert "embedding" not in ProfileItem.__table__.columns
-    assert "embedding_model" not in ProfileItem.__table__.columns
+    assert not {"embedding", "embedding_model"} & {field.name for field in dataclasses.fields(ProfileItem)}

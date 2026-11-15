@@ -6,13 +6,12 @@
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from neo4j import AsyncDriver
 from pydantic import BaseModel, TypeAdapter
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from hiremate_ai.contract import ApplicantDetail, CompanyProfile
 from hiremate_ai.db.profile import ItemAgent, ItemCategory, Verification
 from hiremate_ai.db.profile_store import NewItem, ProfileFields, save_profile
-from hiremate_ai.db.session import session_factory
 from hiremate_ai.tools.candidates import CandidateMatch, CandidateSearch
 from hiremate_ai.tools.profile_search import profile_search, search_profiles, simple_terms
 from hiremate_ai.tools.scope import ToolScope
@@ -31,12 +30,12 @@ class SampleProfile(BaseModel):
 SAMPLE_PROFILES = TypeAdapter(list[SampleProfile]).validate_json((SAMPLES_DIR / "profiles.json").read_bytes())
 
 
-async def save_samples(session: AsyncSession, company: CompanyProfile, applicants: Applicants) -> None:
+async def save_samples(graph: AsyncDriver, company: CompanyProfile, applicants: Applicants) -> None:
     """더미 프로필 8명을 지원서 분석 Agent처럼 저장한다."""
     for sample in SAMPLE_PROFILES:
         applicant = applicants[sample.name]
         await save_profile(
-            session,
+            graph,
             company_id=company.company_id,
             recruitment_id=applicant.info.recruitment_id,
             application_id=applicant.info.application_id,
@@ -71,12 +70,12 @@ def names(applicants: Applicants, matches: list[CandidateMatch]) -> list[str]:
 
 
 async def test_finance_experience_finds_finance_applicants_only(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
 
     found = await search_profiles(
-        db_session, scope_of(sample_company, sample_applicants), ["금융 도메인 경험"], everyone(sample_applicants)
+        graph, scope_of(sample_company, sample_applicants), ["금융 도메인 경험"], everyone(sample_applicants)
     )
 
     # 정답표: 금융 경험은 정유민 · 김하늘 · 한예린. 박서준은 "결제 도메인은 처음"이 확인 필요 항목이라 빠진다
@@ -89,12 +88,12 @@ async def test_finance_experience_finds_finance_applicants_only(
 
 
 async def test_returned_sentences_are_in_applicant_documents(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
 
     found = await search_profiles(
-        db_session,
+        graph,
         scope_of(sample_company, sample_applicants),
         ["정산", "Spring"],
         everyone(sample_applicants),
@@ -108,13 +107,13 @@ async def test_returned_sentences_are_in_applicant_documents(
 
 
 async def test_more_matched_conditions_come_first_then_pool_order(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     scope = scope_of(sample_company, sample_applicants)
 
-    found = await search_profiles(db_session, scope, ["대용량 트래픽", "카드"], everyone(sample_applicants))
-    again = await search_profiles(db_session, scope, ["대용량 트래픽", "카드"], everyone(sample_applicants))
+    found = await search_profiles(graph, scope, ["대용량 트래픽", "카드"], everyone(sample_applicants))
+    again = await search_profiles(graph, scope, ["대용량 트래픽", "카드"], everyone(sample_applicants))
 
     # 정유민은 두 조건이 다 맞고, 박서준은 대용량 트래픽, 한예린은 카드(카드사 매입 데이터)만 맞는다.
     # 맞은 수가 같으면 후보를 받은 순서(지원 번호)대로다
@@ -127,21 +126,21 @@ async def test_more_matched_conditions_come_first_then_pool_order(
 
 
 async def test_only_candidates_in_pool_and_scope(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     scope = scope_of(sample_company, sample_applicants)
     pool = [sample_applicants["김하늘"].info.application_id, uuid4()]  # 두 번째는 이 전형 밖의 지원자
 
-    found = await search_profiles(db_session, scope, ["금융"], pool)
+    found = await search_profiles(graph, scope, ["금융"], pool)
 
     assert names(sample_applicants, found) == ["김하늘"]
 
 
 async def test_other_company_profiles_are_not_searched(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     scope = scope_of(sample_company, sample_applicants)
     other_company = ToolScope(
         company_id=uuid4(),
@@ -150,31 +149,31 @@ async def test_other_company_profiles_are_not_searched(
         application_ids=scope.application_ids,
     )
 
-    assert await search_profiles(db_session, other_company, ["금융"], everyone(sample_applicants)) == []
+    assert await search_profiles(graph, other_company, ["금융"], everyone(sample_applicants)) == []
 
 
 async def test_check_items_and_document_items_without_evidence_are_not_used(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     scope = scope_of(sample_company, sample_applicants)
 
     # 박서준의 "결제 도메인은 처음"은 확인 필요 항목이라 결제 경험의 근거로 쓰지 않는다
-    payment = await search_profiles(db_session, scope, ["결제"], everyone(sample_applicants))
+    payment = await search_profiles(graph, scope, ["결제"], everyone(sample_applicants))
     # 서민재의 "백엔드 개발 요건 미충족 (프론트엔드 경력)"은 근거 문장이 없는 이력서 항목이라 쓰지 않는다
-    frontend = await search_profiles(db_session, scope, ["프론트엔드"], everyone(sample_applicants))
+    frontend = await search_profiles(graph, scope, ["프론트엔드"], everyone(sample_applicants))
 
     assert "박서준" not in names(sample_applicants, payment)
     assert frontend == []
 
 
 async def test_assessment_items_without_evidence_are_found_by_content(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     applicant = sample_applicants["박서준"]
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -186,7 +185,7 @@ async def test_assessment_items_without_evidence_are_found_by_content(
     )
 
     found = await search_profiles(
-        db_session, scope_of(sample_company, sample_applicants), ["멱등성"], everyone(sample_applicants)
+        graph, scope_of(sample_company, sample_applicants), ["멱등성"], everyone(sample_applicants)
     )
 
     assert names(sample_applicants, found) == ["박서준"]
@@ -194,13 +193,13 @@ async def test_assessment_items_without_evidence_are_found_by_content(
 
 
 async def test_conflict_and_unconfirmed_interview_items_are_not_used(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     applicant = sample_applicants["박서준"]
     # 1) 면접 분석이 확인됨 · 상충 · 미확인 항목을 하나씩 낸 것처럼 저장한다 (셋 다 답변 근거 문장이 있다)
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -232,9 +231,9 @@ async def test_conflict_and_unconfirmed_interview_items_are_not_used(
     )
     scope, pool = scope_of(sample_company, sample_applicants), everyone(sample_applicants)
 
-    confirmed = await search_profiles(db_session, scope, ["멱등성"], pool)
-    conflict = await search_profiles(db_session, scope, ["파티셔닝"], pool)
-    unconfirmed = await search_profiles(db_session, scope, ["샤딩"], pool)
+    confirmed = await search_profiles(graph, scope, ["멱등성"], pool)
+    conflict = await search_profiles(graph, scope, ["파티셔닝"], pool)
+    unconfirmed = await search_profiles(graph, scope, ["샤딩"], pool)
 
     # 2) 확인됨은 근거 문장과 함께 찾고, 상충 · 미확인은 근거로 쓰지 않는다
     assert names(sample_applicants, confirmed) == ["박서준"]
@@ -246,12 +245,12 @@ async def test_conflict_and_unconfirmed_interview_items_are_not_used(
 
 
 async def test_unconfirmed_skill_list_is_used_but_unconfirmed_experience_is_not(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
     applicant = sample_applicants["정유민"]
     # 1) 서류 분석이 본인 여부를 정하지 못한 기술 목록과 경험을 미확인으로 저장한다
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -276,8 +275,8 @@ async def test_unconfirmed_skill_list_is_used_but_unconfirmed_experience_is_not(
     )
     scope, pool = scope_of(sample_company, sample_applicants), everyone(sample_applicants)
 
-    skill = await search_profiles(db_session, scope, ["Kafka"], pool)
-    experience = await search_profiles(db_session, scope, ["파티셔닝"], pool)
+    skill = await search_profiles(graph, scope, ["Kafka"], pool)
+    experience = await search_profiles(graph, scope, ["파티셔닝"], pool)
 
     # 2) 기술 목록은 지원자가 자기 기술로 적은 것이라 찾고, 본인 역할이 불분명한 경험은 근거로 쓰지 않는다
     assert names(sample_applicants, skill) == ["정유민"]
@@ -288,25 +287,24 @@ async def test_unconfirmed_skill_list_is_used_but_unconfirmed_experience_is_not(
 
 
 async def test_discriminatory_conditions_are_not_searched(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
 
     found = await search_profiles(
-        db_session, scope_of(sample_company, sample_applicants), ["30살 이하", "여성"], everyone(sample_applicants)
+        graph, scope_of(sample_company, sample_applicants), ["30살 이하", "여성"], everyone(sample_applicants)
     )
 
     assert found == []
 
 
 async def test_profile_search_fits_root_search_shape(
-    database_url: str, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    search: CandidateSearch = profile_search(session_factory(database_url))
+    search: CandidateSearch = profile_search(graph)
 
-    # 저장된 프로필이 없는 DB에서도 Root가 부르는 모양 그대로 동작한다
+    # 저장된 프로필이 없는 그래프에서도 Root가 부르는 모양 그대로 동작한다
     assert await search(scope_of(sample_company, sample_applicants), ["금융"], everyone(sample_applicants)) == []
-    await session_factory(database_url).kw["bind"].dispose()
 
 
 def test_simple_terms_drops_particles_and_common_words() -> None:

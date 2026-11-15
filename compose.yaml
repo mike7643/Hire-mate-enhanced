@@ -1,4 +1,4 @@
-# 로컬 개발용 PostgreSQL(pgvector) · Redis · Mailpit
+# 로컬 개발용 PostgreSQL(pgvector) · Neo4j · Redis · Mailpit
 # backend는 실행할 때 자동으로 띄운다. ai만 개발할 때는 저장소 루트에서 `docker compose up -d`.
 services:
   postgres:
@@ -14,6 +14,17 @@ services:
     labels:
       # pgvector 이미지를 Spring Boot가 PostgreSQL로 인식하게 한다
       org.springframework.boot.service-connection: postgres
+
+  # 지원자 프로필 그래프(ai). 브라우저는 http://localhost:7474 (neo4j / hiremate-local)
+  neo4j:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: neo4j/hiremate-local
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - neo4j-data:/data
 
   redis:
     image: redis:8
@@ -33,4 +44,5 @@ services:
 
 volumes:
   postgres-data:
+  neo4j-data:
   redis-data:

@@ -4,12 +4,12 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
+from neo4j import AsyncDriver
 
 from hiremate_ai.api.profile import ReadRequest, read_profile_view
+from hiremate_ai.db.graph import get_graph
 from hiremate_ai.db.profile import ItemAgent, ItemCategory, ProfileStatus, Verification
 from hiremate_ai.db.profile_store import NewItem, ProfileFields, save_profile
-from hiremate_ai.db.session import get_session
 from hiremate_ai.main import app
 
 COMPANY_ID = UUID("3c1f5e2a-7b4d-4e8a-9f60-1a2b3c4d5e6f")
@@ -17,12 +17,12 @@ RECRUITMENT_ID = UUID("7a1e2b3c-4d5e-4f60-8a9b-0c1d2e3f4a51")
 STAGE_ID = UUID("6e3d9a2f-4b5c-4d7e-9f01-2a3b4c5d6e7f")
 
 
-async def save_jung(session: AsyncSession) -> UUID:
+async def save_jung(graph: AsyncDriver) -> UUID:
     """가상 지원자 정유민의 서류 · 면접 분석 결과를 저장한다. 확인 상태 네 가지가 모두 들어 있다."""
     application_id = uuid4()
     # 1) 지원서 분석: 근거 있음 · 미확인
     await save_profile(
-        session,
+        graph,
         company_id=COMPANY_ID,
         recruitment_id=RECRUITMENT_ID,
         application_id=application_id,
@@ -45,7 +45,7 @@ async def save_jung(session: AsyncSession) -> UUID:
     )
     # 2) 면접 분석: 확인됨 · 상충
     await save_profile(
-        session,
+        graph,
         company_id=COMPANY_ID,
         recruitment_id=RECRUITMENT_ID,
         application_id=application_id,
@@ -68,7 +68,6 @@ async def save_jung(session: AsyncSession) -> UUID:
             ),
         ],
     )
-    await session.commit()
     return application_id
 
 
@@ -76,8 +75,8 @@ def request(application_id: UUID, company_id: UUID = COMPANY_ID) -> ReadRequest:
     return ReadRequest(company_id=company_id, recruitment_id=RECRUITMENT_ID, application_id=application_id)
 
 
-async def post_read(session: AsyncSession, body: dict[str, Any]) -> Any:
-    app.dependency_overrides[get_session] = lambda: session
+async def post_read(graph: AsyncDriver, body: dict[str, Any]) -> Any:
+    app.dependency_overrides[get_graph] = lambda: graph
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             return await client.post("/agents/profile/read", json=body)
@@ -85,10 +84,10 @@ async def post_read(session: AsyncSession, body: dict[str, Any]) -> Any:
         app.dependency_overrides.clear()
 
 
-async def test_reads_items_with_verification(db_session: AsyncSession) -> None:
-    application_id = await save_jung(db_session)
+async def test_reads_items_with_verification(graph: AsyncDriver) -> None:
+    application_id = await save_jung(graph)
 
-    view = await read_profile_view(db_session, request(application_id))
+    view = await read_profile_view(graph, request(application_id))
 
     assert (view.application_id, view.status, view.summary) == (
         application_id,
@@ -105,11 +104,11 @@ async def test_reads_items_with_verification(db_session: AsyncSession) -> None:
     }
 
 
-async def test_other_company_and_missing_profile_read_as_empty(db_session: AsyncSession) -> None:
-    application_id = await save_jung(db_session)
+async def test_other_company_and_missing_profile_read_as_empty(graph: AsyncDriver) -> None:
+    application_id = await save_jung(graph)
 
-    other_company = await read_profile_view(db_session, request(application_id, company_id=uuid4()))
-    missing = await read_profile_view(db_session, request(uuid4()))
+    other_company = await read_profile_view(graph, request(application_id, company_id=uuid4()))
+    missing = await read_profile_view(graph, request(uuid4()))
 
     # 다른 기업의 프로필은 있어도 없는 것처럼 비어 있다 (규칙 4)
     for view in (other_company, missing):
@@ -117,11 +116,11 @@ async def test_other_company_and_missing_profile_read_as_empty(db_session: Async
     assert other_company.application_id == application_id
 
 
-async def test_route_answers_in_contract_shape(db_session: AsyncSession) -> None:
-    application_id = await save_jung(db_session)
+async def test_route_answers_in_contract_shape(graph: AsyncDriver) -> None:
+    application_id = await save_jung(graph)
     body = {"companyId": str(COMPANY_ID), "recruitmentId": str(RECRUITMENT_ID), "applicationId": str(application_id)}
 
-    response = await post_read(db_session, body)
+    response = await post_read(graph, body)
 
     assert response.status_code == 200
     data = response.json()

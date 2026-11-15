@@ -15,14 +15,14 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from neo4j import AsyncDriver
 
 from hiremate_ai.agents.analysis.application.types import Actor, ApplicationReview, CriterionResult
 from hiremate_ai.agents.generation.report.bundle import BundleStage, Evidence, Fact, ReportBundle, Strength
 from hiremate_ai.agents.generation.report.strength import quote_strength
 from hiremate_ai.contract import StageType
-from hiremate_ai.db.profile import CandidateProfile, ItemAgent, ItemCategory
+from hiremate_ai.db.profile import ItemAgent, ItemCategory
+from hiremate_ai.db.profile_store import load_profiles
 
 APPLICATION_AGENT = "application"
 _DOCUMENT_LABELS = {
@@ -64,30 +64,25 @@ class StageItems(Protocol):
 class DbStageItems:
     """지원자 프로필에서 평가 · 면접 항목을 읽는다. 기업 · 채용 범위로만 읽는다 (아키텍처 규칙 4)."""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
-        self._sessions = sessions
+    def __init__(self, graph: AsyncDriver) -> None:
+        self._graph = graph
 
     async def stage_items(
         self, *, company_id: UUID, recruitment_id: UUID, application_ids: list[UUID]
     ) -> dict[UUID, list[StageItem]]:
         if not application_ids:
             return {}
-        async with self._sessions() as session:
-            profiles = await session.scalars(
-                select(CandidateProfile).where(
-                    CandidateProfile.application_id.in_(application_ids),
-                    CandidateProfile.company_id == company_id,
-                    CandidateProfile.recruitment_id == recruitment_id,
-                )
-            )
-            return {
-                profile.application_id: [
-                    StageItem(item.stage_id, item.agent, item.category, item.content, item.evidence, item.source)
-                    for item in profile.items
-                    if item.agent in (ItemAgent.ASSESSMENT, ItemAgent.INTERVIEW) and item.stage_id is not None
-                ]
-                for profile in profiles
-            }
+        profiles = await load_profiles(
+            self._graph, company_id=company_id, recruitment_id=recruitment_id, application_ids=application_ids
+        )
+        return {
+            profile.application_id: [
+                StageItem(item.stage_id, item.agent, item.category, item.content, item.evidence, item.source)
+                for item in profile.items
+                if item.agent in (ItemAgent.ASSESSMENT, ItemAgent.INTERVIEW) and item.stage_id is not None
+            ]
+            for profile in profiles
+        }
 
 
 def stage_prefix(stages: list[BundleStage], stage: BundleStage) -> str:

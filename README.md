@@ -156,6 +156,8 @@ flowchart TB
     Backend -->|public 스키마| DB[(RDS PostgreSQL / pgvector)]
     API -->|ai 스키마| DB
     Worker -->|ai 스키마| DB
+    API -->|지원자 프로필| Graph[(Neo4j)]
+    Worker -->|지원자 프로필| Graph
     Backend --> Files[(비공개 S3 / 지원 파일)]
     API --> LLM[모델 API]
     Worker --> LLM
@@ -163,7 +165,7 @@ flowchart TB
     classDef app fill:#f3ecff,stroke:#863bff,color:#30204d
     classDef storage fill:#eaf7f4,stroke:#098b7b,color:#135b51
     class Web,Backend,API,Worker app
-    class Redis,DB,Files storage
+    class Redis,DB,Graph,Files storage
 ```
 
 - **업무 데이터의 쓰기 주체는 Backend**다. AI는 지원자 프로필, 분석 결과, 호출 로그와 Chat 대화를 `ai` 스키마에 저장한다.
@@ -179,7 +181,7 @@ flowchart TB
 | 클라이언트 상태와 폼 | TanStack Query, Zustand, React Hook Form, Zod                  | 서버 상태, 클라이언트 상태, 입력 검증       |
 | Backend              | Java 25, Spring Boot 4, Spring Security, Spring Modulith, JPA  | 업무 API, 인증과 권한, 모듈 경계            |
 | AI                   | Python 3.13, FastAPI, LangGraph, LangChain                     | 요청 계획, 분석과 생성, SSE 응답            |
-| 데이터               | PostgreSQL 17, pgvector, Redis 8, S3                           | 업무 데이터, 벡터 검색, 세션과 대기열, 파일 |
+| 데이터               | PostgreSQL 17, pgvector, Neo4j 5, Redis 8, S3                  | 업무 데이터, 벡터 검색, 지원자 프로필 그래프, 세션과 대기열, 파일 |
 | 인프라               | Docker Compose, Nginx, GitHub Actions, AWS EC2 / RDS           | 실행 환경과 CI/CD                           |
 | 품질                 | Checkstyle, Vitest, ESLint, Ruff, mypy, pytest, Testcontainers | 코드 검사와 자동 테스트                     |
 
@@ -199,11 +201,11 @@ HireMate/
 │   └── src/hiremate_ai/
 │       ├── agents/        Root, 분석, 생성 Agent
 │       ├── llm/           공통 모델 클라이언트와 호출 기록
-│       ├── db/            AI 스키마와 Alembic 마이그레이션
+│       ├── db/            AI 스키마와 Alembic 마이그레이션, 지원자 프로필 그래프
 │       ├── ncs_search/    NCS 참고 검색과 질의 임베딩
 │       └── worker/        비동기 작업 처리
 ├── contract/              Backend와 AI가 공유하는 JSON 계약 샘플
 ├── scripts/demo/          가상 지원자를 이용한 데모
-├── compose.yaml           로컬 PostgreSQL, Redis, Mailpit
+├── compose.yaml           로컬 PostgreSQL, Neo4j, Redis, Mailpit
 └── compose.production.yaml  운영 서비스 구성
 ```

@@ -49,6 +49,7 @@ services:
     env_file: /opt/hiremate/runtime.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      GRAPH_URI: bolt://neo4j:7687
       BACKEND_BASE_URL: http://backend:8080
       NCS_EMBED_URL: http://embedding:8002
       PGSSLMODE: verify-full
@@ -58,6 +59,7 @@ services:
       - /opt/hiremate/poster-reference-data:/app/poster-reference-data:ro
     depends_on:
       - redis
+      - neo4j
       - embedding
     restart: unless-stopped
 
@@ -67,6 +69,7 @@ services:
     env_file: /opt/hiremate/runtime.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      GRAPH_URI: bolt://neo4j:7687
       BACKEND_BASE_URL: http://backend:8080
       NCS_EMBED_URL: http://embedding:8002
       PGSSLMODE: verify-full
@@ -75,6 +78,7 @@ services:
       - /opt/hiremate/rds-ca-bundle.pem:/etc/ssl/certs/rds-ca-bundle.pem:ro
     depends_on:
       - redis
+      - neo4j
       - embedding
     restart: unless-stopped
 
@@ -98,6 +102,20 @@ services:
       - redis-data:/data
     restart: unless-stopped
 
+  # 지원자 프로필 그래프(ai). 포트를 열지 않아 내부망의 ai, worker만 쓴다.
+  # 비밀번호는 서버의 neo4j.env에 NEO4J_AUTH=neo4j/<비밀번호>로 두고, 같은 값을 runtime.env의 GRAPH_PASSWORD에 적는다.
+  # runtime.env를 그대로 주지 않는다. Neo4j 이미지는 NEO4J_로 시작하는 환경 변수를 모두 설정으로 읽는다
+  neo4j:
+    image: neo4j:5.26-community
+    env_file: /opt/hiremate/neo4j.env
+    environment:
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - neo4j-data:/data
+    restart: unless-stopped
+
   # 안내 메일을 실제로 보내지 않고 받아 두는 SMTP 서버(로컬 compose.yaml과 같은 Mailpit).
   # 메일함은 Nginx의 /mailpit/ 경로로만 열고, 로그인 계정은 서버의 htpasswd 파일에 둔다
   mailpit:
@@ -119,5 +137,6 @@ services:
 
 volumes:
   redis-data:
+  neo4j-data:
   mailpit-data:
   embedding-model-cache:

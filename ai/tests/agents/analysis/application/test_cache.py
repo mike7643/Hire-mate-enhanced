@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from application_context import make_posting, make_rubric
+from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hiremate_ai.agents.analysis.application.service import analyze_application
@@ -44,7 +45,7 @@ def test_hash_invalidates_date_actual_recipe_and_scope(
 
 
 async def test_store_checks_scope_even_when_application_and_hash_match(
-    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail]
+    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail], graph: AsyncDriver
 ) -> None:
     applicant = sample_applicants["정유민"]
     rubric = make_rubric()
@@ -60,7 +61,10 @@ async def test_store_checks_scope_even_when_application_and_hash_match(
 
 
 async def test_independent_application_reuses_only_matching_date_and_model(
-    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail], sample_posting: PostingContent
+    db_session: AsyncSession,
+    sample_applicants: dict[str, ApplicantDetail],
+    sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
     applicant = sample_applicants["정유민"].model_copy(update={"documents": []})
     store = DbReviewStore(sessions_of(db_session))
@@ -87,6 +91,7 @@ async def test_unknown_model_identity_never_reuses_review(
     sample_applicants: dict[str, ApplicantDetail],
     sample_posting: PostingContent,
     monkeypatch: pytest.MonkeyPatch,
+    graph: AsyncDriver,
 ) -> None:
     llm = FakeLlm()
     monkeypatch.setattr(llm, "analysis_recipe", lambda: None)
@@ -115,6 +120,7 @@ async def test_application_does_not_reuse_review_after_reading_policy_changes(
     sample_applicants: dict[str, ApplicantDetail],
     sample_posting: PostingContent,
     monkeypatch: pytest.MonkeyPatch,
+    graph: AsyncDriver,
 ) -> None:
     from hiremate_ai.agents.analysis.application import service
 

@@ -4,7 +4,7 @@
 원문 문서를 처음부터 다시 읽지 않고, 분석 Agent들이 미리 정리해 둔 내용을 바로 볼 수 있다.
 
 이 파일에 있는 것
-- read_profile: 조회 범위를 확인하고 프로필 한 명분을 DB에서 꺼낸다
+- read_profile: 조회 범위를 확인하고 프로필 한 명분을 그래프에서 꺼낸다
 - profile_text: 프로필을 모델이 읽을 글로 바꾼다
 - profile_tool: Root 도구 루프에 넣을 @tool을 만든다
 
@@ -18,24 +18,20 @@ Root에 연결하는 예 (지원자 번호 "C1"을 지원서 id로 바꾸는 함
         row = resolve_ref(scope.chat, ref)        # RootToolContext는 ToolScope를 물려받는다
         return row.application_id if row else None
 
-    tool = profile_tool(session_factory(), resolve=to_application_id)
+    tool = profile_tool(graph_driver(), resolve=to_application_id)
     toolkit = RootToolkit(..., answer_tools=(*ANSWER_TOOLS, tool))
 """
 
 from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager
 from uuid import UUID
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.tools import BaseTool
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from neo4j import AsyncDriver
 
 from hiremate_ai.db.profile import CandidateProfile, ItemCategory, ProfileItem, ProfileStatus, Verification
+from hiremate_ai.db.profile_store import load_profile
 from hiremate_ai.tools.scope import ToolScope
-
-type Sessions = Callable[[], AbstractAsyncContextManager[AsyncSession]]
-"""DB 세션을 여는 함수. 보통 db.session.session_factory()를 넘긴다."""
 
 type ResolveRef = Callable[[ToolScope, str], UUID | None]
 """모델이 쓴 지원자 지칭("C1" 등)을 지원서 id로 바꾸는 함수. 찾지 못하면 None."""
@@ -64,18 +60,14 @@ _VERIFICATION_LABELS: dict[str, str] = {
 }
 
 
-async def read_profile(session: AsyncSession, scope: ToolScope, application_id: UUID) -> CandidateProfile | None:
+async def read_profile(graph: AsyncDriver, scope: ToolScope, application_id: UUID) -> CandidateProfile | None:
     """조회 범위 안의 지원자면 프로필을 돌려준다. 범위 밖이거나 프로필이 없으면 None."""
-    # 1) 현재 전형의 지원자가 아니면 DB를 보지도 않는다
+    # 1) 현재 전형의 지원자가 아니면 그래프를 보지도 않는다
     if application_id not in scope.application_ids:
         return None
     # 2) 같은 지원서 id라도 기업 · 채용이 맞는 프로필만 꺼낸다 (다른 기업 데이터 차단)
-    return await session.scalar(
-        select(CandidateProfile).where(
-            CandidateProfile.application_id == application_id,
-            CandidateProfile.company_id == scope.company_id,
-            CandidateProfile.recruitment_id == scope.recruitment_id,
-        )
+    return await load_profile(
+        graph, company_id=scope.company_id, recruitment_id=scope.recruitment_id, application_id=application_id
     )
 
 
@@ -108,10 +100,10 @@ def ordered_items(profile: CandidateProfile) -> list[ProfileItem]:
     return sorted(profile.items, key=lambda item: (_category_rank(item), item.created_at, item.id))
 
 
-def profile_tool(sessions: Sessions, *, resolve: ResolveRef) -> BaseTool:
+def profile_tool(graph: AsyncDriver, *, resolve: ResolveRef) -> BaseTool:
     """Root 도구 루프에 넣을 get_candidate_profile 도구를 만든다.
 
-    sessions: DB 세션을 여는 함수 (예: session_factory())
+    graph: 프로필 그래프 드라이버 (예: graph_driver())
     resolve: 모델이 쓴 지원자 번호를 지원서 id로 바꾸는 함수. Root가 자기 지원자 목록으로 만들어 넘긴다.
     """
 
@@ -128,11 +120,8 @@ def profile_tool(sessions: Sessions, *, resolve: ResolveRef) -> BaseTool:
         application_id = resolve(scope, candidate)
         if application_id is None or application_id not in scope.application_ids:
             return OUT_OF_SCOPE
-        # 2) 부를 때마다 세션을 열고, 읽은 뒤 닫는다
-        async with sessions() as session:
-            profile = await read_profile(session, scope, application_id)
-            # 3) 세션이 열려 있는 동안 글로 바꾼다 (닫힌 뒤에는 항목을 읽을 수 없다)
-            return NO_PROFILE if profile is None else profile_text(profile)
+        profile = await read_profile(graph, scope, application_id)
+        return NO_PROFILE if profile is None else profile_text(profile)
 
     return get_candidate_profile
 

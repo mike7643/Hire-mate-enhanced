@@ -3,6 +3,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from neo4j import AsyncDriver
 from root_context import make_context, save_sample_profiles, sessions_of
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -220,8 +221,9 @@ async def test_profile_toolkit_search_puts_profile_sentences_first(
     sample_applicants: Applicants,
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
-    await save_sample_profiles(db_session, sample_company, sample_applicants)
+    await save_sample_profiles(graph, sample_company, sample_applicants)
     context = context_of(sample_applicants, sample_company, sample_posting)
     search = profile_toolkit(sessions_of(db_session)).search
 
@@ -237,9 +239,10 @@ async def test_profile_toolkit_search_reads_documents_of_applicants_without_prof
     sample_applicants: Applicants,
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
     # 지원서 분석을 마친 지원자는 정유민뿐이다
-    await save_sample_profiles(db_session, sample_company, sample_applicants, names=["정유민"])
+    await save_sample_profiles(graph, sample_company, sample_applicants, names=["정유민"])
     context = context_of(sample_applicants, sample_company, sample_posting)
     search = profile_toolkit(sessions_of(db_session)).search
 
@@ -253,10 +256,11 @@ async def test_profile_toolkit_search_finds_assessment_items_not_in_documents(
     sample_applicants: Applicants,
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
     seo = sample_applicants["서민재"].info
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=seo.recruitment_id,
         application_id=seo.application_id,
@@ -318,12 +322,13 @@ async def test_profile_evidence_reads_items_with_evidence_in_scope(
     sample_applicants: Applicants,
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
     jung = sample_applicants["정유민"].info
     note = "장애 원인을 로그로 좁혀 가는 과정을 팀원에게 차근차근 설명했어요."
     conflict = "테스트 코드는 시간이 없어 작성하지 못했습니다."
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=jung.recruitment_id,
         application_id=jung.application_id,
@@ -343,7 +348,7 @@ async def test_profile_evidence_reads_items_with_evidence_in_scope(
     )
     outside = uuid4()
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=jung.recruitment_id,
         application_id=outside,
@@ -579,11 +584,12 @@ async def test_db_readers_read_saved_profile_and_missing_review(
     sample_applicants: Applicants,
     sample_company: CompanyProfile,
     sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
-    await save_sample_profiles(db_session, sample_company, sample_applicants, names=["정유민"])
+    await save_sample_profiles(graph, sample_company, sample_applicants, names=["정유민"])
     context = _evidence_context(sample_applicants, sample_company, sample_posting)
     scope = scope_of(context)
-    read = db_profile_reader(sessions_of(db_session))
+    read = db_profile_reader(graph)
     review = db_review_reader(sessions_of(db_session))
 
     saved = await read(scope, sample_applicants["정유민"].info.application_id)

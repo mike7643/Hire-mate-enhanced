@@ -1,4 +1,4 @@
-"""분석 결과 저장 · 재사용. ai.application_reviews에 원본을, ai.candidate_profiles에 요약과 항목을 넣는다.
+"""분석 결과 저장 · 재사용. ai.application_reviews에 원본을, 지원자 프로필 그래프에 요약과 항목을 넣는다.
 
 같은 입력(공고 · 서류 · 평가 기준 · 분석 버전)이면 저장된 결과를 쓰고 모델을 다시 부르지 않는다.
 """
@@ -9,6 +9,7 @@ from datetime import date
 from typing import Any, Protocol
 from uuid import UUID
 
+from neo4j import AsyncDriver
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,7 @@ from hiremate_ai.config import settings
 from hiremate_ai.contract import ApplicantDetail, PostingContent
 from hiremate_ai.db.analysis_store import AnalysisArtifactStore, DbAnalysisArtifacts
 from hiremate_ai.db.application_review import ApplicationReviewRecord
+from hiremate_ai.db.graph import graph_driver
 from hiremate_ai.db.profile import ItemAgent
 from hiremate_ai.db.profile_store import ProfileScopeError, save_profile
 from hiremate_ai.llm.recipe import fingerprint
@@ -43,11 +45,15 @@ class ReviewStore(Protocol):
 
 
 class DbReviewStore:
-    """세션을 짧게 열고 닫는다. 모델을 기다리는 동안 DB 연결을 잡고 있지 않는다."""
+    """세션을 짧게 열고 닫는다. 모델을 기다리는 동안 DB 연결을 잡고 있지 않는다.
 
-    def __init__(self, sessions: Sessions) -> None:
+    분석 원본은 PostgreSQL에, 지원자 프로필은 그래프에 넣는다. graph를 비우면 설정의 그래프(graph_driver)를 쓴다.
+    """
+
+    def __init__(self, sessions: Sessions, graph: AsyncDriver | None = None) -> None:
         self._sessions = sessions
-        self.artifacts: AnalysisArtifactStore | None = DbAnalysisArtifacts(sessions)
+        self._graph = graph
+        self.artifacts: AnalysisArtifactStore | None = DbAnalysisArtifacts(sessions, graph=graph)
 
     async def find(
         self, application_id: UUID, input_hash: str, *, company_id: UUID, recruitment_id: UUID
@@ -78,7 +84,11 @@ class DbReviewStore:
             return _parse(record)
 
     async def save(self, review: ApplicationReview, applicant: ApplicantDetail, rubric: ScreeningRubric) -> None:
-        """원본을 넣고(같은 입력이면 바꿔 쓰고) 프로필을 갱신한다. 둘을 한 트랜잭션으로 커밋한다."""
+        """원본을 넣고(같은 입력이면 바꿔 쓰고) 프로필을 갱신한다.
+
+        프로필을 그래프에 먼저 저장하고 원본을 커밋한다. 원본이 남아 있으면 그 프로필도 저장되어 있다.
+        커밋이 실패하면 분석을 다시 하고 프로필 항목도 같은 Agent의 새 결과로 바뀐다.
+        """
         async with self._sessions() as session:
             record = await session.scalar(
                 select(ApplicationReviewRecord).where(
@@ -104,7 +114,7 @@ class DbReviewStore:
                 record.review = review.model_dump(mode="json")
             fields, items = to_profile(review)
             await save_profile(
-                session,
+                self._graph or graph_driver(),
                 company_id=rubric.company_id,
                 recruitment_id=rubric.recruitment_id,
                 application_id=review.application_id,
