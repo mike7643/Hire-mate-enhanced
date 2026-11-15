@@ -2,7 +2,7 @@ from datetime import date
 from uuid import uuid4
 
 import pytest
-from application_context import make_posting, make_rubric, scripted, yumin_script
+from application_context import YUMIN_API, make_posting, make_rubric, scripted, yumin_script
 from neo4j import AsyncDriver
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,7 +25,7 @@ from hiremate_ai.contract import ApplicantDetail, PostingContent
 from hiremate_ai.db.analysis_artifact import AnalysisArtifactRecord
 from hiremate_ai.db.analysis_store import session_artifacts
 from hiremate_ai.db.profile import ItemAgent, ItemCategory, ProfileStatus
-from hiremate_ai.db.profile_store import NewItem, ProfileScopeError, save_profile
+from hiremate_ai.db.profile_store import NewItem, ProfileScopeError, load_profile, save_profile
 from hiremate_ai.llm.fake import FakeLlm
 
 
@@ -228,3 +228,55 @@ async def test_independent_application_saves_document_artifacts_for_readonly_reu
     )
     # 날짜가 바뀌어 다시 분석해도 서류는 다시 읽지 않는다
     assert not any(issubclass(call.output, DocumentReading) for call in another.calls)
+
+
+async def test_application_analysis_links_extracted_experience_and_skills_in_profile_graph(
+    db_session: AsyncSession,
+    sample_applicants: dict[str, ApplicantDetail],
+    sample_posting: PostingContent,
+    graph: AsyncDriver,
+) -> None:
+    """서류 읽기가 낸 회사 이름, 기술, 업무 분야가 지원서 분석을 거쳐 프로필 그래프의 관계로 남는다."""
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def borrow() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    applicant = sample_applicants["정유민"]
+    script = yumin_script()
+    [reading] = script.extract.values()
+    fact = ExtractedFact(
+        kind="EXPERIENCE",
+        statement="카드 결제 승인 · 정산 API를 개발했다.",
+        actor="SELF",
+        evidence=[YUMIN_API],
+        experience="한빛카드",
+        action="DEVELOP",
+        skills=["Java", "Spring Boot", "Kafka"],
+        domains=["금융"],
+    )
+    script.extract.update({key: reading.model_copy(update={"facts": [fact]}) for key in script.extract})
+
+    await analyze_application(
+        scripted(script),
+        DbReviewStore(borrow),
+        applicant,
+        make_posting(sample_posting),
+        make_rubric(),
+        budget_seconds=20,
+        today=date(2026, 10, 27),
+    )
+
+    profile = await load_profile(
+        graph,
+        company_id=make_rubric().company_id,
+        recruitment_id=applicant.info.recruitment_id,
+        application_id=applicant.info.application_id,
+    )
+    assert profile is not None
+    [item] = [item for item in profile.items if item.experience is not None]
+    assert (item.experience, item.actor, item.action, item.domains) == ("한빛카드", "SELF", "DEVELOP", ("금융",))
+    # 근거 문장에 적힌 기술만 남는다 (Kafka는 그 문장에 없다)
+    assert item.skills == ("Java", "Spring Boot")

@@ -111,6 +111,11 @@ class Fact(_Record):
     actor: Actor
     quotes: list[Quote]
     supported: bool = True  # 검토에서 근거가 주장을 받쳐 주지 않으면 False
+    # 프로필 그래프에서 사실끼리 잇는 값. 서류에서 확인된 것만 남긴다 (extract.merge)
+    experience: str = ""  # 이 사실이 속한 회사 · 프로젝트 이름. 원문 표기 그대로
+    action: str = ""  # 한 일의 종류 (extract.ACTIONS). 해당 없으면 빈 값
+    skills: list[str] = []  # 근거 문장에 적힌 기술 · 도구 이름. 원문 표기 그대로
+    domains: list[str] = []  # 모델이 근거 문장으로 분류한 업무 분야 (예: 금융)
 
 
 class Achievement(_Record):
