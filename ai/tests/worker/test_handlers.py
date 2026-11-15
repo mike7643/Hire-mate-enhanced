@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from application_context import YUMIN_SUMMARY, make_posting, make_rubric, scripted, yumin_script
+from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hiremate_ai.agents.analysis.application.types import ApplicationReview, ScreeningRubric
@@ -121,7 +122,9 @@ ASSESSMENT_JSON: dict[str, Any] = {
 async def test_assessment_analyze_saves_through_the_route_function(monkeypatch: pytest.MonkeyPatch) -> None:
     received: list[AssessmentInput] = []
 
-    async def analyze_and_save(data: AssessmentInput, llm: LlmClient, session: AsyncSession) -> AnalyzeResult:
+    async def analyze_and_save(
+        data: AssessmentInput, llm: LlmClient, session: AsyncSession, graph: AsyncDriver
+    ) -> AnalyzeResult:
         received.append(data)
         return AnalyzeResult(status=ProfileStatus.DONE, saved=2, dropped=1)
 
@@ -136,7 +139,9 @@ async def test_assessment_analyze_saves_through_the_route_function(monkeypatch: 
 
 
 async def test_assessment_of_another_company_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def analyze_and_save(data: AssessmentInput, llm: LlmClient, session: AsyncSession) -> AnalyzeResult:
+    async def analyze_and_save(
+        data: AssessmentInput, llm: LlmClient, session: AsyncSession, graph: AsyncDriver
+    ) -> AnalyzeResult:
         raise ProfileScopeError("다른 채용의 프로필이다")
 
     monkeypatch.setattr(worker_handlers.assessment, "analyze_and_save", analyze_and_save)
@@ -225,7 +230,7 @@ async def test_interview_analyze_saves_through_the_route_function(monkeypatch: p
     received: list[InterviewAnalysisInput] = []
 
     async def analyze_and_save(
-        data: InterviewAnalysisInput, llm: LlmClient, session: AsyncSession
+        data: InterviewAnalysisInput, llm: LlmClient, session: AsyncSession, graph: AsyncDriver
     ) -> interview.AnalyzeResult:
         received.append(data)
         return interview.AnalyzeResult(status=ProfileStatus.DONE, saved=3, dropped=0)
@@ -242,7 +247,7 @@ async def test_interview_analyze_saves_through_the_route_function(monkeypatch: p
 
 async def test_interview_of_another_company_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
     async def analyze_and_save(
-        data: InterviewAnalysisInput, llm: LlmClient, session: AsyncSession
+        data: InterviewAnalysisInput, llm: LlmClient, session: AsyncSession, graph: AsyncDriver
     ) -> interview.AnalyzeResult:
         raise ProfileScopeError("다른 채용의 프로필이다")
 

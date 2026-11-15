@@ -7,14 +7,15 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
+from neo4j import AsyncDriver
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hiremate_ai.db.analysis_artifact import AnalysisArtifactRecord
-from hiremate_ai.db.profile import CandidateProfile
-from hiremate_ai.db.profile_store import ProfileScopeError
+from hiremate_ai.db.graph import graph_driver
+from hiremate_ai.db.profile_store import ProfileScopeError, profile_owner
 from hiremate_ai.llm.recipe import fingerprint
 
 if TYPE_CHECKING:
@@ -82,9 +83,11 @@ class AnalysisArtifactStore(AnalysisArtifactReader, Protocol):
 
 
 class DbAnalysisArtifacts:
-    def __init__(self, sessions: Sessions, *, commit: bool = True) -> None:
+    def __init__(self, sessions: Sessions, *, commit: bool = True, graph: AsyncDriver | None = None) -> None:
+        """graph는 지원자 프로필 그래프다. 비우면 설정의 그래프(graph_driver)를 쓴다."""
         self._sessions = sessions
         self._commit = commit
+        self._graph = graph
 
     async def find_extraction(
         self,
@@ -287,16 +290,10 @@ class DbAnalysisArtifacts:
         recipe_hash: str,
     ) -> None:
         digest = _input_hash(company_id, recruitment_id, application_id, stage_id, kind, source_hash, recipe_hash)
+        owner = await profile_owner(self._graph or graph_driver(), application_id)
+        if owner is not None and owner != (company_id, recruitment_id):
+            raise ProfileScopeError("저장할 분석 산출물과 지원자 프로필의 기업 또는 채용이 다르다")
         async with self._sessions() as session:
-            owner = (
-                await session.execute(
-                    select(CandidateProfile.company_id, CandidateProfile.recruitment_id).where(
-                        CandidateProfile.application_id == application_id
-                    )
-                )
-            ).one_or_none()
-            if owner is not None and (owner.company_id, owner.recruitment_id) != (company_id, recruitment_id):
-                raise ProfileScopeError("저장할 분석 산출물과 지원자 프로필의 기업 또는 채용이 다르다")
             statement = insert(AnalysisArtifactRecord).values(
                 company_id=company_id,
                 recruitment_id=recruitment_id,
@@ -329,14 +326,14 @@ class DbAnalysisArtifacts:
                 await session.flush()
 
 
-def session_artifacts(session: AsyncSession) -> DbAnalysisArtifacts:
-    """호출자의 트랜잭션에 참여한다. 면접 프로필과 산출물을 함께 커밋한다."""
+def session_artifacts(session: AsyncSession, graph: AsyncDriver | None = None) -> DbAnalysisArtifacts:
+    """호출자의 트랜잭션에 참여한다. 면접 산출물은 호출자가 커밋한다."""
 
     @asynccontextmanager
     async def borrow() -> AsyncIterator[AsyncSession]:
         yield session
 
-    return DbAnalysisArtifacts(borrow, commit=False)
+    return DbAnalysisArtifacts(borrow, commit=False, graph=graph)
 
 
 def _document_hash(document: ApplicantDocument) -> str:

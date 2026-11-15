@@ -11,7 +11,7 @@ tools.candidates.CandidateSearch 모양을 따른다. (조회 범위, 조건들,
 서류 점수 · 평가 점수 같은 숫자 조건은 Root가 backend 값(ChatContext)으로 거른 뒤 후보 id로 넘긴다.
 
 Root에 연결하는 예
-    search = profile_search(session_factory(), terms=concept_terms)
+    search = profile_search(graph_driver(), terms=concept_terms)
     toolkit = RootToolkit(search=search, ...)
 """
 
@@ -20,12 +20,12 @@ import re
 from collections.abc import Callable, Sequence
 from uuid import UUID
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from neo4j import AsyncDriver
 
 from hiremate_ai.agents.guardrails import blocked_attribute
 from hiremate_ai.contract import DocumentType
-from hiremate_ai.db.profile import CandidateProfile, ItemCategory, ProfileItem, Verification
+from hiremate_ai.db.profile import ItemCategory, ProfileItem, Verification
+from hiremate_ai.db.profile_store import load_profiles
 from hiremate_ai.tools.candidates import CandidateMatch, CandidateSearch, SourcedSentence
 from hiremate_ai.tools.scope import ToolScope
 
@@ -70,7 +70,7 @@ def simple_terms(concept: str) -> list[str]:
 
 
 async def search_profiles(
-    session: AsyncSession,
+    graph: AsyncDriver,
     scope: ToolScope,
     concepts: Sequence[str],
     pool: Sequence[UUID],
@@ -84,12 +84,8 @@ async def search_profiles(
     if not term_sets or not order:
         return []
 
-    profiles = await session.scalars(
-        select(CandidateProfile).where(
-            CandidateProfile.company_id == scope.company_id,
-            CandidateProfile.recruitment_id == scope.recruitment_id,
-            CandidateProfile.application_id.in_(order),
-        )
+    profiles = await load_profiles(
+        graph, company_id=scope.company_id, recruitment_id=scope.recruitment_id, application_ids=order
     )
     by_id = {profile.application_id: profile for profile in profiles}
 
@@ -112,12 +108,11 @@ async def search_profiles(
     return sorted(matches, key=lambda match: -match.hits)
 
 
-def profile_search(sessions: async_sessionmaker[AsyncSession], *, terms: TermsOf = simple_terms) -> CandidateSearch:
-    """Root의 RootToolkit.search에 넣을 검색 함수를 만든다. 부를 때마다 세션을 열고 닫는다."""
+def profile_search(graph: AsyncDriver, *, terms: TermsOf = simple_terms) -> CandidateSearch:
+    """Root의 RootToolkit.search에 넣을 검색 함수를 만든다."""
 
     async def search(scope: ToolScope, concepts: Sequence[str], pool: Sequence[UUID]) -> list[CandidateMatch]:
-        async with sessions() as session:
-            return await search_profiles(session, scope, concepts, pool, terms=terms)
+        return await search_profiles(graph, scope, concepts, pool, terms=terms)
 
     return search
 

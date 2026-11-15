@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 
 from application_context import COMPANY_ID, make_posting, make_rubric
+from neo4j import AsyncDriver
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,7 +12,8 @@ from hiremate_ai.agents.analysis.application.store import DbReviewStore, Session
 from hiremate_ai.agents.analysis.application.types import ApplicationReview, Note, ScreeningRubric
 from hiremate_ai.contract import ApplicantDetail, CriterionType, PostingContent
 from hiremate_ai.db.application_review import ApplicationReviewRecord
-from hiremate_ai.db.profile import CandidateProfile, ProfileStatus
+from hiremate_ai.db.profile import ProfileStatus
+from hiremate_ai.db.profile_store import load_profile
 
 
 def sessions_of(session: AsyncSession) -> Sessions:
@@ -53,7 +55,7 @@ def test_input_hash_changes_only_with_inputs_that_change_results(
 
 
 async def test_saves_review_and_profile_then_finds_them(
-    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail]
+    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail], graph: AsyncDriver
 ) -> None:
     applicant = sample_applicants["정유민"]
     store = DbReviewStore(sessions_of(db_session))
@@ -94,15 +96,18 @@ async def test_saves_review_and_profile_then_finds_them(
         )
         == again
     )
-    profile = await db_session.scalar(
-        select(CandidateProfile).where(CandidateProfile.application_id == applicant.info.application_id)
+    profile = await load_profile(
+        graph,
+        company_id=COMPANY_ID,
+        recruitment_id=make_rubric().recruitment_id,
+        application_id=applicant.info.application_id,
     )
     assert profile is not None
     assert (profile.company_id, profile.status) == (COMPANY_ID, ProfileStatus.CHECK)
 
 
 async def test_reviews_saved_in_an_older_shape_are_analyzed_again(
-    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail]
+    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail], graph: AsyncDriver
 ) -> None:
     applicant = sample_applicants["정유민"]
     store = DbReviewStore(sessions_of(db_session))

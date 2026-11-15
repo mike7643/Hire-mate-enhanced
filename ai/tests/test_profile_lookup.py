@@ -1,23 +1,19 @@
 """프로필 조회 도구 테스트. 더미 프로필(tests/samples/profiles.json)을 저장하고 Root 도구 루프처럼 불러 본다."""
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
+from neo4j import AsyncDriver, AsyncGraphDatabase
 from pydantic import BaseModel, TypeAdapter
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from hiremate_ai.contract import ApplicantDetail, CompanyProfile
 from hiremate_ai.db.profile import ItemAgent
 from hiremate_ai.db.profile_store import NewItem, ProfileFields, save_profile
-from hiremate_ai.db.session import session_factory
 from hiremate_ai.llm.fake import FakeLlm, ToolCall
 from hiremate_ai.tools.profile_lookup import (
     NO_PROFILE,
     OUT_OF_SCOPE,
     ResolveRef,
-    Sessions,
     profile_text,
     profile_tool,
     read_profile,
@@ -45,12 +41,12 @@ class Answer(BaseModel):
 SAMPLE_PROFILES = TypeAdapter(list[SampleProfile]).validate_json((SAMPLES_DIR / "profiles.json").read_bytes())
 
 
-async def save_samples(session: AsyncSession, company: CompanyProfile, applicants: Applicants) -> None:
+async def save_samples(graph: AsyncDriver, company: CompanyProfile, applicants: Applicants) -> None:
     """더미 프로필 8명을 지원서 분석 Agent처럼 저장한다."""
     for sample in SAMPLE_PROFILES:
         applicant = applicants[sample.name]
         await save_profile(
-            session,
+            graph,
             company_id=company.company_id,
             recruitment_id=applicant.info.recruitment_id,
             application_id=applicant.info.application_id,
@@ -77,21 +73,11 @@ def numbered(applicants: Applicants) -> ResolveRef:
     return lambda scope, ref: by_no.get(ref.strip().upper())
 
 
-def sessions_of(session: AsyncSession) -> Sessions:
-    """테스트 세션을 그대로 빌려주는 Sessions. 닫지 않아야 테스트가 끝날 때 한꺼번에 되돌릴 수 있다."""
-
-    @asynccontextmanager
-    async def opened() -> AsyncIterator[AsyncSession]:
-        yield session
-
-    return opened
-
-
 async def test_root_tool_loop_reads_profile_with_scope_from_code(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
-    tool = profile_tool(sessions_of(db_session), resolve=numbered(sample_applicants))
+    await save_samples(graph, sample_company, sample_applicants)
+    tool = profile_tool(graph, resolve=numbered(sample_applicants))
     # 모델은 도구를 한 번 부르고(C1 = 정유민) 답을 낸다
     llm = FakeLlm(ToolCall("get_candidate_profile", {"candidate": "C1"}), Answer(text="금융 경험이 분명해요"))
 
@@ -107,20 +93,20 @@ async def test_root_tool_loop_reads_profile_with_scope_from_code(
 
 
 def test_model_cannot_choose_scope() -> None:
-    tool = profile_tool(session_factory("postgresql+psycopg://unused@localhost/unused"), resolve=uuid_ref)
+    tool = profile_tool(AsyncGraphDatabase.driver("bolt://unused"), resolve=uuid_ref)
 
     # 모델이 채우는 인자는 지원자 번호뿐이다. 기업 · 채용 · 전형은 코드가 runtime.context로 넣는다
     assert set(tool.args) == {"candidate"}
 
 
 async def test_profile_text_shows_front_and_items_with_evidence(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     scope = scope_of(sample_company, sample_applicants)
 
-    jung = await read_profile(db_session, scope, sample_applicants["정유민"].info.application_id)
-    yoon = await read_profile(db_session, scope, sample_applicants["윤태오"].info.application_id)
+    jung = await read_profile(graph, scope, sample_applicants["정유민"].info.application_id)
+    yoon = await read_profile(graph, scope, sample_applicants["윤태오"].info.application_id)
 
     assert jung is not None and yoon is not None
     jung_text = profile_text(jung).splitlines()
@@ -140,24 +126,24 @@ async def test_profile_text_shows_front_and_items_with_evidence(
 
 
 async def test_read_profile_stays_in_scope(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
-    await save_samples(db_session, sample_company, sample_applicants)
+    await save_samples(graph, sample_company, sample_applicants)
     scope = scope_of(sample_company, sample_applicants)
     jung = sample_applicants["정유민"].info.application_id
     other_company = ToolScope(uuid4(), scope.recruitment_id, scope.stage_id, scope.application_ids)
     other_stage = ToolScope(scope.company_id, scope.recruitment_id, uuid4(), frozenset())
 
-    assert await read_profile(db_session, scope, jung) is not None
-    assert await read_profile(db_session, other_company, jung) is None  # 다른 기업
-    assert await read_profile(db_session, other_stage, jung) is None  # 이 전형의 지원자가 아님
+    assert await read_profile(graph, scope, jung) is not None
+    assert await read_profile(graph, other_company, jung) is None  # 다른 기업
+    assert await read_profile(graph, other_stage, jung) is None  # 이 전형의 지원자가 아님
 
 
 async def test_unknown_candidate_and_missing_profile(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: Applicants
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: Applicants
 ) -> None:
     # 프로필을 하나도 저장하지 않았다 (분석 전)
-    tool = profile_tool(sessions_of(db_session), resolve=numbered(sample_applicants))
+    tool = profile_tool(graph, resolve=numbered(sample_applicants))
     llm = FakeLlm(
         [
             ToolCall("get_candidate_profile", {"candidate": "C99"}),

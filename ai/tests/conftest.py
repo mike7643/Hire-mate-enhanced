@@ -1,18 +1,23 @@
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from langsmith import Client, tracing_context
+from neo4j import AsyncDriver, AsyncGraphDatabase
 from pydantic import SecretStr, TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from testcontainers.community.neo4j import Neo4jContainer
 from testcontainers.community.postgres import PostgresContainer
 
 from hiremate_ai.config import settings
 from hiremate_ai.contract import ApplicantDetail, CompanyProfile, PostingContent
+from hiremate_ai.db import graph as graph_module
+from hiremate_ai.db.graph import graph_driver
 from hiremate_ai.llm import tracing
 from hiremate_ai.llm.tracing import traced
 
@@ -21,6 +26,7 @@ SAMPLES_DIR = AI_DIR / "tests" / "samples"
 
 # compose.yaml과 같은 이미지
 POSTGRES_IMAGE = "pgvector/pgvector:pg17"
+NEO4J_IMAGE = "neo4j:5.26-community"
 
 
 def pytest_asyncio_loop_factories(
@@ -102,6 +108,50 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
             await session.close()
             await transaction.rollback()
     await engine.dispose()
+
+
+_open_graph = AsyncGraphDatabase.driver
+
+
+def _closed_graph(uri: str, **options: Any) -> AsyncDriver:
+    """연결할 수 없는 드라이버. 읽거나 쓰면 다시 시도하지 않고 바로 실패한다."""
+    return _open_graph("bolt://127.0.0.1:1", max_transaction_retry_time=0, **options)
+
+
+@pytest.fixture(autouse=True)
+def no_graph(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """graph fixture를 받지 않은 테스트가 개발자의 로컬 프로필 그래프에 쓰지 못하게 닫힌 주소로 돌린다.
+
+    드라이버는 만들 수 있지만(연결은 처음 쓸 때 한다) 그래프를 읽거나 쓰면 연결하지 못해 실패한다.
+    """
+    monkeypatch.setattr(graph_module.AsyncGraphDatabase, "driver", staticmethod(_closed_graph))
+    graph_driver.cache_clear()
+    yield
+    graph_driver.cache_clear()
+
+
+@pytest.fixture(scope="session")
+def graph_server() -> Iterator[Neo4jContainer]:
+    """테스트용 Neo4j. Docker가 필요하다."""
+    with Neo4jContainer(NEO4J_IMAGE) as neo4j:
+        yield neo4j
+
+
+@pytest.fixture
+async def graph(
+    graph_server: Neo4jContainer, no_graph: None, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[AsyncDriver]:
+    """테스트마다 비운 프로필 그래프. graph_driver()도 이 그래프를 돌려준다."""
+    monkeypatch.setattr(graph_module.AsyncGraphDatabase, "driver", _open_graph)
+    monkeypatch.setattr(settings, "graph_uri", graph_server.get_connection_url())
+    monkeypatch.setattr(settings, "graph_user", graph_server.username)
+    monkeypatch.setattr(settings, "graph_password", SecretStr(graph_server.password))
+    driver = graph_driver()
+    await driver.execute_query("MATCH (n) DETACH DELETE n")
+    try:
+        yield driver
+    finally:
+        await driver.close()
 
 
 @pytest.fixture(scope="session")

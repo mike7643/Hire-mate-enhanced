@@ -1,24 +1,32 @@
 """지원자 프로필 (FR-08, 13, 14).
 
 분석 Agent(지원서 · 평가 · 면접)가 낸 결과를 지원자별로 쌓아 두고, Root Agent가 조건으로 지원자를 찾을 때 쓴다.
-- CandidateProfile: 지원자 한 명당 한 줄. 경력 연수, 마지막 회사처럼 조건 검색에 쓰는 값
-- ProfileItem: 지원자 한 명당 여러 줄. 경험, 역량 같은 항목과 그 근거 문장, 출처, 확인 상태
+프로필은 그래프(Neo4j)에 저장한다. 저장과 조회는 db.profile_store가 한다.
+
+그래프 모양
+    (ApplicationProfile)-[:HAS_CLAIM]->(Claim)-[:SUPPORTED_BY]->(Evidence)-[:FROM_SOURCE]->(Source)
+    (Claim)-[:FROM_SOURCE]->(Source)      근거 문장이 없는 항목
+    (Claim)-[:USES_SKILL]->(Skill)        기술 · 역량 항목
+    (Claim)-[:IN_DOMAIN]->(Domain)        업무 도메인 항목
+
+- ApplicationProfile: 지원서 하나. 경력 연수, 마지막 회사처럼 조건 검색에 쓰는 값
+- Claim: 프로필 항목 한 줄. 분류, 내용, 확인 상태, 만든 Agent, 전형
+- Evidence: 원문에서 찾은 근거 문장. Source: 그 문장이 나온 자료 (이력서, 평가 결과, 면접 답변 등)
+- Skill, Domain: 같은 기업 안에서 항목들이 함께 가리키는 기술 · 도메인. 내용 글을 그대로 이름으로 쓴다
+
+이 모듈의 CandidateProfile, ProfileItem은 그래프에서 읽은 값이다.
 
 규칙
 - 분석 Agent가 낸 값을 그대로 저장한다. 이 모듈은 점수를 다시 매기거나 문장을 고치지 않는다.
 - 이름, 연락처는 backend에 있으므로 저장하지 않고 지원서 ID로만 연결한다.
 - 나이, 성별, 출신 지역, 혼인 여부, 신체 조건은 저장하지 않는다 (아키텍처 규칙 6).
-- 조회는 항상 기업 · 채용 범위로 거른다 (아키텍처 규칙 4).
+- 조회는 항상 기업 · 채용 범위로 거른다 (아키텍처 규칙 4). Skill, Domain 노드도 기업마다 따로 둔다.
 """
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from uuid import UUID, uuid4
-
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from hiremate_ai.db.base import SCHEMA, Base
+from uuid import UUID
 
 
 class ProfileStatus(StrEnum):
@@ -61,47 +69,35 @@ class ItemAgent(StrEnum):
     INTERVIEW = "interview"  # 면접 분석
 
 
-class CandidateProfile(Base):
-    """지원자 한 명의 프로필. 지원서(application_id)마다 하나다."""
+@dataclass(frozen=True)
+class ProfileItem:
+    """프로필 항목 한 줄 (Claim). 내용과 근거 문장, 출처, 확인 상태를 함께 둔다 (아키텍처 규칙 7)."""
 
-    __tablename__ = "candidate_profiles"
-    __table_args__ = (Index("ix_candidate_profiles_scope", "company_id", "recruitment_id"),)
+    id: UUID
+    category: str  # ItemCategory 값
+    agent: str  # ItemAgent 값
+    content: str  # 정리한 내용 (예: "금융 (카드 결제 · 정산)")
+    evidence: str | None  # 원문에서 찾은 근거 문장. 없으면 None
+    verification: str  # Verification 값 (확인 상태)
+    source: str  # 출처 (예: 이력서, 자기소개서, 평가 결과, 면접 답변)
+    stage_id: UUID | None  # 평가 · 면접 항목이면 그 전형 ID. 지원서 항목은 None
+    created_at: datetime
 
-    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    # backend의 지원서 · 기업 · 채용 ID. 다른 스키마라 외래 키는 걸지 않는다
-    application_id: Mapped[UUID] = mapped_column(unique=True)
-    company_id: Mapped[UUID]
-    recruitment_id: Mapped[UUID]
-    status: Mapped[str] = mapped_column(String(10))  # ProfileStatus 값
+
+@dataclass(frozen=True)
+class CandidateProfile:
+    """지원자 한 명의 프로필 (ApplicationProfile). 지원서(application_id)마다 하나다."""
+
+    # backend의 지원서 · 기업 · 채용 ID
+    application_id: UUID
+    company_id: UUID
+    recruitment_id: UUID
+    status: str  # ProfileStatus 값
     # 조건 검색에 쓰는 값. 분석 전이거나 찾지 못하면 None
-    career_years: Mapped[int | None]
-    last_company: Mapped[str | None] = mapped_column(String(200))
-    summary: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    items: Mapped[list["ProfileItem"]] = relationship(
-        back_populates="profile", cascade="all, delete-orphan", lazy="selectin", order_by="ProfileItem.created_at"
-    )
-
-
-class ProfileItem(Base):
-    """프로필 항목 한 줄. 내용과 근거 문장, 출처, 확인 상태를 함께 둔다 (아키텍처 규칙 7)."""
-
-    __tablename__ = "profile_items"
-    __table_args__ = (Index("ix_profile_items_profile_id", "profile_id"),)
-
-    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    profile_id: Mapped[UUID] = mapped_column(ForeignKey(f"{SCHEMA}.candidate_profiles.id", ondelete="CASCADE"))
-    category: Mapped[str] = mapped_column(String(20))  # ItemCategory 값
-    agent: Mapped[str] = mapped_column(String(20))  # ItemAgent 값
-    content: Mapped[str] = mapped_column(Text)  # 정리한 내용 (예: "금융 (카드 결제 · 정산)")
-    evidence: Mapped[str | None] = mapped_column(Text)  # 원문에서 찾은 근거 문장. 없으면 None
-    verification: Mapped[str] = mapped_column(String(12))  # Verification 값 (확인 상태)
-    source: Mapped[str] = mapped_column(String(50))  # 출처 (예: 이력서, 자기소개서, 평가 결과, 면접 답변)
-    stage_id: Mapped[UUID | None]  # 평가 · 면접 항목이면 그 전형 ID. 지원서 항목은 None
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    profile: Mapped[CandidateProfile] = relationship(back_populates="items")
+    career_years: int | None
+    last_company: str | None
+    summary: str
+    created_at: datetime
+    updated_at: datetime
+    # 저장된 순서
+    items: list[ProfileItem] = field(default_factory=list)

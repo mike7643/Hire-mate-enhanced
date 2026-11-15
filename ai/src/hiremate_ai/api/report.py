@@ -12,7 +12,7 @@ from hiremate_ai.agents.generation.report import (
 )
 from hiremate_ai.agents.generation.report.enrich import DbStageItems
 from hiremate_ai.contract import ContractModel
-from hiremate_ai.db.session import session_factory
+from hiremate_ai.db.graph import GraphDep
 from hiremate_ai.llm.client import LlmDep
 
 router = APIRouter(prefix="/agents/report")
@@ -25,8 +25,8 @@ class ComposeRequest(ContractModel):
 
 
 @router.post("/compose")
-async def compose(request: ComposeRequest, llm: LlmDep, store: StoreDep) -> ComposedReport:
-    bundle = await enrich(request.bundle, store, DbStageItems(session_factory()))
+async def compose(request: ComposeRequest, llm: LlmDep, store: StoreDep, graph: GraphDep) -> ComposedReport:
+    bundle = await enrich(request.bundle, store, DbStageItems(graph))
     return await compose_report(bundle, llm)
 
 

@@ -11,12 +11,12 @@ POST /agents/profile/read  요청 {"companyId", "recruitmentId", "applicationId"
 from uuid import UUID
 
 from fastapi import APIRouter
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from neo4j import AsyncDriver
 
 from hiremate_ai.contract import ContractModel
-from hiremate_ai.db.profile import CandidateProfile, ProfileStatus, Verification
-from hiremate_ai.db.session import SessionDep
+from hiremate_ai.db.graph import GraphDep
+from hiremate_ai.db.profile import ProfileStatus, Verification
+from hiremate_ai.db.profile_store import load_profile
 
 router = APIRouter(prefix="/agents/profile")
 
@@ -53,15 +53,14 @@ class CandidateProfileView(ContractModel):
     items: list[ProfileItemView]
 
 
-async def read_profile_view(session: AsyncSession, request: ReadRequest) -> CandidateProfileView:
+async def read_profile_view(graph: AsyncDriver, request: ReadRequest) -> CandidateProfileView:
     """요청한 기업 · 채용 범위 안에서 지원자 프로필을 읽어 화면용으로 바꾼다."""
     # 1) 지원서 · 기업 · 채용이 모두 맞는 프로필만 찾는다 (다른 기업 프로필은 없는 것과 같다)
-    profile = await session.scalar(
-        select(CandidateProfile).where(
-            CandidateProfile.application_id == request.application_id,
-            CandidateProfile.company_id == request.company_id,
-            CandidateProfile.recruitment_id == request.recruitment_id,
-        )
+    profile = await load_profile(
+        graph,
+        company_id=request.company_id,
+        recruitment_id=request.recruitment_id,
+        application_id=request.application_id,
     )
     if profile is None:
         return CandidateProfileView(application_id=request.application_id, status=None, summary="", items=[])
@@ -87,5 +86,5 @@ async def read_profile_view(session: AsyncSession, request: ReadRequest) -> Cand
 
 
 @router.post("/read")
-async def read(request: ReadRequest, session: SessionDep) -> CandidateProfileView:
-    return await read_profile_view(session, request)
+async def read(request: ReadRequest, graph: GraphDep) -> CandidateProfileView:
+    return await read_profile_view(graph, request)

@@ -1,17 +1,29 @@
-"""프로필 저장 함수 테스트. 지원서 분석 Agent가 낸 것처럼 만든 더미 결과(tests/samples/profiles.json)를 저장해 본다."""
+"""프로필 저장 함수 테스트. 지원서 분석 Agent가 낸 것처럼 만든 더미 결과(tests/samples/profiles.json)를 저장해 본다.
 
+Docker로 띄운 Neo4j에 실제로 넣고 읽어 본다.
+"""
+
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from neo4j import AsyncDriver
 from pydantic import BaseModel, TypeAdapter
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from hiremate_ai.agents.guardrails import blocked_attribute
 from hiremate_ai.contract import ApplicantDetail, CompanyProfile
-from hiremate_ai.db.profile import CandidateProfile, ItemAgent, ItemCategory, ProfileStatus, Verification
-from hiremate_ai.db.profile_store import NewItem, ProfileFields, ProfileScopeError, save_profile
+from hiremate_ai.db.profile import CandidateProfile, ItemAgent, ItemCategory, ProfileItem, ProfileStatus, Verification
+from hiremate_ai.db.profile_store import (
+    NewItem,
+    ProfileFields,
+    ProfileScopeError,
+    import_profile,
+    load_profile,
+    load_profiles,
+    profile_owner,
+    save_profile,
+)
 
 SAMPLES_DIR = Path(__file__).resolve().parent / "samples"
 
@@ -31,12 +43,12 @@ SAMPLE_PROFILES = {
 
 
 async def save_sample(
-    session: AsyncSession, company: CompanyProfile, applicant: ApplicantDetail, items: list[NewItem] | None = None
+    graph: AsyncDriver, company: CompanyProfile, applicant: ApplicantDetail, items: list[NewItem] | None = None
 ) -> CandidateProfile:
     """가상 지원자 한 명의 더미 분석 결과를 지원서 분석 Agent처럼 저장한다."""
     sample = SAMPLE_PROFILES[applicant.info.name]
     return await save_profile(
-        session,
+        graph,
         company_id=company.company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -47,12 +59,19 @@ async def save_sample(
     )
 
 
-async def reload(session: AsyncSession, application_id: UUID) -> CandidateProfile:
-    """메모리에 남은 객체를 비우고 DB에서 다시 읽는다."""
-    session.expunge_all()
-    profile = await session.scalar(select(CandidateProfile).where(CandidateProfile.application_id == application_id))
+async def reload(graph: AsyncDriver, application_id: UUID) -> CandidateProfile:
+    """그래프에서 다시 읽는다."""
+    owner = await profile_owner(graph, application_id)
+    assert owner is not None
+    profile = await load_profile(graph, company_id=owner[0], recruitment_id=owner[1], application_id=application_id)
     assert profile is not None
     return profile
+
+
+async def count(graph: AsyncDriver, pattern: str) -> int:
+    """패턴에 맞는 그래프 조각 수."""
+    records, _, _ = await graph.execute_query(f"MATCH {pattern} RETURN count(*) AS total")
+    return int(records[0]["total"])
 
 
 def test_dummy_profiles_cover_every_sample_applicant(sample_applicants: dict[str, ApplicantDetail]) -> None:
@@ -64,13 +83,12 @@ def test_dummy_profiles_cover_every_sample_applicant(sample_applicants: dict[str
 
 
 async def test_saves_application_analysis(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["정유민"]
-    await save_sample(db_session, sample_company, applicant)
-    await db_session.commit()
+    await save_sample(graph, sample_company, applicant)
 
-    profile = await reload(db_session, applicant.info.application_id)
+    profile = await reload(graph, applicant.info.application_id)
 
     assert profile.company_id == sample_company.company_id
     assert profile.status == ProfileStatus.DONE
@@ -86,12 +104,21 @@ async def test_saves_application_analysis(
 
 
 async def test_saves_all_sample_applicants_as_given(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     for applicant in sample_applicants.values():
-        await save_sample(db_session, sample_company, applicant)
+        await save_sample(graph, sample_company, applicant)
 
-    saved = {profile.application_id: profile for profile in (await db_session.scalars(select(CandidateProfile))).all()}
+    applicant = next(iter(sample_applicants.values()))
+    saved = {
+        profile.application_id: profile
+        for profile in await load_profiles(
+            graph,
+            company_id=sample_company.company_id,
+            recruitment_id=applicant.info.recruitment_id,
+            application_ids=[applicant.info.application_id for applicant in sample_applicants.values()],
+        )
+    }
 
     for applicant in sample_applicants.values():
         sample = SAMPLE_PROFILES[applicant.info.name]
@@ -104,7 +131,7 @@ async def test_saves_all_sample_applicants_as_given(
 
 
 async def test_drops_item_whose_evidence_is_not_in_documents(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["정유민"]
     items = [
@@ -117,23 +144,23 @@ async def test_drops_item_whose_evidence_is_not_in_documents(
         NewItem(category=ItemCategory.CHECK, content="대용량 근거 확인 필요", evidence=None, source="이력서"),
     ]
 
-    profile = await save_sample(db_session, sample_company, applicant, items)
+    profile = await save_sample(graph, sample_company, applicant, items)
 
     # 원문에 없는 근거를 단 항목은 버리고, 근거가 없는 확인 필요 항목은 남긴다
     assert [item.content for item in profile.items] == ["대용량 근거 확인 필요"]
 
 
 async def test_sets_verification_from_evidence_unless_agent_gives_it(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["정유민"]
     sample = SAMPLE_PROFILES["정유민"]
     no_evidence = NewItem(category=ItemCategory.CHECK, content="대용량 근거 확인 필요", source="이력서")
     # 1) 지원서 분석은 확인 상태를 넘기지 않는다 → 근거 문장이 있으면 근거 있음, 없으면 미확인
-    await save_sample(db_session, sample_company, applicant, [sample.items[0], no_evidence])
+    await save_sample(graph, sample_company, applicant, [sample.items[0], no_evidence])
     # 2) 면접 분석은 확인됨 · 상충을 넘긴다. 근거 문장이 없으면 무엇을 넘겼든 미확인
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -162,9 +189,8 @@ async def test_sets_verification_from_evidence_unless_agent_gives_it(
             ),
         ],
     )
-    await db_session.commit()
 
-    profile = await reload(db_session, applicant.info.application_id)
+    profile = await reload(graph, applicant.info.application_id)
 
     states = {item.content: item.verification for item in profile.items}
     assert states == {
@@ -177,7 +203,7 @@ async def test_sets_verification_from_evidence_unless_agent_gives_it(
 
 
 async def test_corrects_source_to_document_that_has_the_sentence(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["정유민"]
     wrong_source = NewItem(
@@ -187,19 +213,19 @@ async def test_corrects_source_to_document_that_has_the_sentence(
         source="이력서",  # 실제로는 자기소개서에 있는 문장
     )
 
-    profile = await save_sample(db_session, sample_company, applicant, [wrong_source])
+    profile = await save_sample(graph, sample_company, applicant, [wrong_source])
 
     assert profile.items[0].source == "자기소개서"
 
 
 async def test_reanalysis_replaces_only_items_of_same_agent_and_stage(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["정유민"]
-    await save_sample(db_session, sample_company, applicant)
+    await save_sample(graph, sample_company, applicant)
     assessment_stage = uuid4()
     await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -210,9 +236,8 @@ async def test_reanalysis_replaces_only_items_of_same_agent_and_stage(
 
     # 지원서를 다시 분석해 항목이 하나로 줄었다
     sample = SAMPLE_PROFILES["정유민"]
-    await save_sample(db_session, sample_company, applicant, sample.items[:1])
-    await db_session.commit()
-    profile = await reload(db_session, applicant.info.application_id)
+    await save_sample(graph, sample_company, applicant, sample.items[:1])
+    profile = await reload(graph, applicant.info.application_id)
 
     application_items = [item for item in profile.items if item.agent == ItemAgent.APPLICATION]
     assessment_items = [item for item in profile.items if item.agent == ItemAgent.ASSESSMENT]
@@ -221,12 +246,12 @@ async def test_reanalysis_replaces_only_items_of_same_agent_and_stage(
 
 
 async def test_result_before_application_analysis_creates_check_profile(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["김하늘"]
 
     profile = await save_profile(
-        db_session,
+        graph,
         company_id=sample_company.company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -240,17 +265,147 @@ async def test_result_before_application_analysis_creates_check_profile(
 
 
 async def test_rejects_profile_of_other_company(
-    db_session: AsyncSession, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["정유민"]
-    await save_sample(db_session, sample_company, applicant)
+    await save_sample(graph, sample_company, applicant)
 
     with pytest.raises(ProfileScopeError):
         await save_profile(
-            db_session,
+            graph,
             company_id=uuid4(),  # 다른 기업
             recruitment_id=applicant.info.recruitment_id,
             application_id=applicant.info.application_id,
             agent=ItemAgent.APPLICATION,
             items=[],
         )
+
+
+async def test_rejected_save_leaves_profile_unchanged(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    applicant = sample_applicants["정유민"]
+    before = await save_sample(graph, sample_company, applicant)
+
+    with pytest.raises(ProfileScopeError):
+        await save_profile(
+            graph,
+            company_id=uuid4(),  # 다른 기업
+            recruitment_id=applicant.info.recruitment_id,
+            application_id=applicant.info.application_id,
+            agent=ItemAgent.APPLICATION,
+            items=[],
+        )
+
+    assert await reload(graph, applicant.info.application_id) == before
+
+
+async def test_keeps_saved_order(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    applicant = sample_applicants["정유민"]
+    sample = SAMPLE_PROFILES["정유민"]
+
+    profile = await save_sample(graph, sample_company, applicant)
+
+    assert [item.content for item in profile.items] == [item.content for item in sample.items]
+
+
+async def test_stores_claims_with_evidence_source_and_concepts(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    applicant = sample_applicants["정유민"]
+    sample = SAMPLE_PROFILES["정유민"]
+    await save_sample(graph, sample_company, applicant)
+
+    with_evidence = [item for item in sample.items if item.evidence is not None]
+    assert await count(graph, "(:ApplicationProfile)-[:HAS_CLAIM]->(:Claim)") == len(sample.items)
+    # 근거 문장이 있는 항목은 근거 문장을 거쳐, 없는 항목은 바로 자료에 이어진다
+    assert await count(graph, "(:Claim)-[:SUPPORTED_BY]->(:Evidence)-[:FROM_SOURCE]->(:Source)") == len(with_evidence)
+    assert await count(graph, "(:Claim)-[:FROM_SOURCE]->(:Source)") == len(sample.items) - len(with_evidence)
+    # 기술과 도메인 항목은 기업의 기술, 도메인 노드를 가리킨다
+    domains = [item for item in sample.items if item.category == ItemCategory.DOMAIN]
+    skills = [item for item in sample.items if item.category == ItemCategory.SKILL]
+    assert await count(graph, "(:Claim)-[:IN_DOMAIN]->(:Domain)") == len(domains)
+    assert await count(graph, "(:Claim)-[:USES_SKILL]->(:Skill)") == len(skills)
+
+
+async def test_same_skill_is_one_node_within_company_only(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    kafka = [NewItem(category=ItemCategory.SKILL, content="Kafka", source="이력서")]
+    spaced = [NewItem(category=ItemCategory.SKILL, content=" kafka ", source="이력서")]
+    jung, kim = sample_applicants["정유민"], sample_applicants["김하늘"]
+    await save_sample(graph, sample_company, jung, kafka)
+    await save_sample(graph, sample_company, kim, spaced)
+    # 다른 기업의 지원자
+    await save_profile(
+        graph,
+        company_id=uuid4(),
+        recruitment_id=uuid4(),
+        application_id=uuid4(),
+        agent=ItemAgent.APPLICATION,
+        items=kafka,
+    )
+
+    assert await count(graph, "(:Skill)") == 2
+    assert await count(graph, f"(:Claim)-[:USES_SKILL]->(:Skill {{companyId: '{sample_company.company_id}'}})") == 2
+
+
+async def test_reanalysis_removes_old_evidence_and_unused_sources(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    applicant = sample_applicants["정유민"]
+    await save_sample(graph, sample_company, applicant)
+
+    await save_sample(graph, sample_company, applicant, [])
+
+    assert await count(graph, "(:Claim)") == 0
+    assert await count(graph, "(:Evidence)") == 0
+    assert await count(graph, "(:Source)") == 0
+
+
+async def test_import_keeps_ids_and_times_and_is_repeatable(graph: AsyncDriver) -> None:
+    created = datetime(2026, 3, 2, 9, 0, tzinfo=UTC)
+    stage_id = uuid4()
+    profile = CandidateProfile(
+        application_id=uuid4(),
+        company_id=uuid4(),
+        recruitment_id=uuid4(),
+        status=ProfileStatus.DONE,
+        career_years=4,
+        last_company="한빛카드",
+        summary="서류 분석 완료",
+        created_at=created,
+        updated_at=created + timedelta(days=1),
+        items=[
+            ProfileItem(
+                id=uuid4(),
+                category=ItemCategory.DOMAIN,
+                agent=ItemAgent.APPLICATION,
+                content="금융 (카드 결제 · 정산)",
+                evidence="한빛카드에서 카드 결제 승인 시스템을 개발했습니다.",
+                verification=Verification.EVIDENCED,
+                source="이력서",
+                stage_id=None,
+                created_at=created,
+            ),
+            ProfileItem(
+                id=uuid4(),
+                category=ItemCategory.STRENGTH,
+                agent=ItemAgent.INTERVIEW,
+                content="장애 대응 당번 경험",
+                evidence=None,
+                verification=Verification.UNCONFIRMED,
+                source="면접 답변",
+                stage_id=stage_id,
+                created_at=created + timedelta(hours=1),
+            ),
+        ],
+    )
+
+    assert await import_profile(graph, profile) == 2
+    assert await import_profile(graph, profile) == 0
+
+    assert await reload(graph, profile.application_id) == profile
+    assert await count(graph, "(:Claim)") == 2

@@ -3,6 +3,7 @@ from uuid import uuid4
 
 import pytest
 from application_context import make_posting, make_rubric, scripted, yumin_script
+from neo4j import AsyncDriver
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,9 +30,9 @@ from hiremate_ai.llm.fake import FakeLlm
 
 
 async def test_document_artifacts_require_same_original_recipe_and_scope(
-    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail]
+    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail], graph: AsyncDriver
 ) -> None:
-    artifacts = session_artifacts(db_session)
+    artifacts = session_artifacts(db_session, graph)
     applicant = sample_applicants["정유민"]
     document = applicant.documents[0]
     scope = {
@@ -63,12 +64,12 @@ async def test_document_artifacts_require_same_original_recipe_and_scope(
 
 
 async def test_independent_artifact_writer_rejects_existing_profile_of_other_company(
-    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail]
+    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail], graph: AsyncDriver
 ) -> None:
     applicant = sample_applicants["정유민"]
     company_id = uuid4()
     await save_profile(
-        db_session,
+        graph,
         company_id=company_id,
         recruitment_id=applicant.info.recruitment_id,
         application_id=applicant.info.application_id,
@@ -76,7 +77,7 @@ async def test_independent_artifact_writer_rejects_existing_profile_of_other_com
         items=[],
     )
     with pytest.raises(ProfileScopeError):
-        await session_artifacts(db_session).save_extraction(
+        await session_artifacts(db_session, graph).save_extraction(
             company_id=uuid4(),
             recruitment_id=applicant.info.recruitment_id,
             application_id=applicant.info.application_id,
@@ -120,8 +121,10 @@ def interview() -> InterviewAnalysisInput:
     )
 
 
-async def test_interview_artifacts_revalidate_original_evidence_and_completion(db_session: AsyncSession) -> None:
-    artifacts = session_artifacts(db_session)
+async def test_interview_artifacts_revalidate_original_evidence_and_completion(
+    db_session: AsyncSession, graph: AsyncDriver
+) -> None:
+    artifacts = session_artifacts(db_session, graph)
     data = interview()
     analysis = InterviewAnalysis(
         status=ProfileStatus.DONE,
@@ -163,24 +166,27 @@ async def test_incomplete_interview_results_are_not_saved(db_session: AsyncSessi
 
 
 async def test_independent_interview_wrapper_reuses_saved_analysis_and_invalidates_context(
-    db_session: AsyncSession,
+    db_session: AsyncSession, graph: AsyncDriver
 ) -> None:
     data = interview()
     draft = InterviewDraft(
         findings=[FindingDraft(kind="CONFIRMED", content="API 캐시를 설계했다.", evidence=data.questions[0].answer)]
     )
     first = FakeLlm(draft)
-    await analyze_and_save(data, first, db_session)
+    await analyze_and_save(data, first, db_session, graph)
     second = FakeLlm()
-    await analyze_and_save(data, second, db_session)
+    await analyze_and_save(data, second, db_session, graph)
     assert len(first.calls) == 1 and not second.calls
     changed = FakeLlm(draft)
-    await analyze_and_save(data.model_copy(update={"stage_name": "다른 면접"}), changed, db_session)
+    await analyze_and_save(data.model_copy(update={"stage_name": "다른 면접"}), changed, db_session, graph)
     assert len(changed.calls) == 1
 
 
 async def test_independent_application_saves_document_artifacts_for_readonly_reuse(
-    db_session: AsyncSession, sample_applicants: dict[str, ApplicantDetail], sample_posting: PostingContent
+    db_session: AsyncSession,
+    sample_applicants: dict[str, ApplicantDetail],
+    sample_posting: PostingContent,
+    graph: AsyncDriver,
 ) -> None:
     from collections.abc import AsyncIterator
     from contextlib import asynccontextmanager
@@ -197,7 +203,7 @@ async def test_independent_application_saves_document_artifacts_for_readonly_reu
     )
     recipe = reading_recipe(llm)
     assert recipe is not None
-    artifacts = session_artifacts(db_session)
+    artifacts = session_artifacts(db_session, graph)
     for document in applicant.documents:
         assert (
             await artifacts.find_reading(

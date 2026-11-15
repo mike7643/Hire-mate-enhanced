@@ -2,13 +2,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hiremate_ai.agents.analysis.interview import InterviewAnalysisInput, InterviewReference, analyze_interview
 from hiremate_ai.agents.analysis.interview.types import FindingDraft, InterviewDraft
-from hiremate_ai.db.profile import CandidateProfile, ItemAgent, ItemCategory, ProfileStatus
-from hiremate_ai.db.profile_store import NewItem, save_profile
+from hiremate_ai.db.profile import ItemAgent, ItemCategory, ProfileStatus
+from hiremate_ai.db.profile_store import NewItem, load_profile, profile_owner, save_profile
 from hiremate_ai.db.session import get_session
 from hiremate_ai.llm.chat import LlmOutputError
 from hiremate_ai.llm.client import get_llm
@@ -227,6 +227,7 @@ async def test_model_format_errors_end_as_failed_without_raising() -> None:
 
 
 async def post_analyze(session: AsyncSession, llm: FakeLlm, body: dict[str, Any]) -> Any:
+    """프로필 그래프는 graph fixture가 맞춘 graph_driver()를 쓴다."""
     app.dependency_overrides[get_llm] = lambda: llm
     app.dependency_overrides[get_session] = lambda: session
     try:
@@ -236,19 +237,21 @@ async def post_analyze(session: AsyncSession, llm: FakeLlm, body: dict[str, Any]
         app.dependency_overrides.clear()
 
 
-async def profile_items(session: AsyncSession, application_id: UUID) -> list[tuple[str, str, UUID | None]]:
-    session.expunge_all()
-    profile = await session.scalar(select(CandidateProfile).where(CandidateProfile.application_id == application_id))
+async def profile_items(graph: AsyncDriver, application_id: UUID) -> list[tuple[str, str, UUID | None]]:
+    owner = await profile_owner(graph, application_id)
+    assert owner is not None
+    profile = await load_profile(graph, company_id=owner[0], recruitment_id=owner[1], application_id=application_id)
     assert profile is not None
-    # 한 트랜잭션 안의 테스트라 created_at이 같다. 저장 순서 대신 내용으로 비교한다
     return sorted((item.agent, item.content, item.stage_id) for item in profile.items)
 
 
-async def test_reanalysis_replaces_only_this_stage_interview_items(db_session: AsyncSession) -> None:
+async def test_reanalysis_replaces_only_this_stage_interview_items(
+    db_session: AsyncSession, graph: AsyncDriver
+) -> None:
     application_id = UUID(INPUT_JSON["applicationId"])
     stage_id = UUID(INPUT_JSON["stageId"])
     await save_profile(
-        db_session,
+        graph,
         company_id=UUID(INPUT_JSON["companyId"]),
         recruitment_id=UUID(INPUT_JSON["recruitmentId"]),
         application_id=application_id,
@@ -264,7 +267,7 @@ async def test_reanalysis_replaces_only_this_stage_interview_items(db_session: A
 
     assert response.status_code == 200
     assert response.json() == {"status": "DONE", "saved": 1, "dropped": 0}
-    assert await profile_items(db_session, application_id) == sorted(
+    assert await profile_items(graph, application_id) == sorted(
         [
             (ItemAgent.APPLICATION, "금융 (카드 결제)", None),
             (ItemAgent.INTERVIEW, confirmed().content, stage_id),
@@ -272,7 +275,7 @@ async def test_reanalysis_replaces_only_this_stage_interview_items(db_session: A
     )
 
 
-async def test_router_refuses_profile_of_another_company(db_session: AsyncSession) -> None:
+async def test_router_refuses_profile_of_another_company(db_session: AsyncSession, graph: AsyncDriver) -> None:
     await post_analyze(db_session, FakeLlm(InterviewDraft(findings=[confirmed()])), INPUT_JSON)
 
     response = await post_analyze(
