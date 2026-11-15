@@ -227,7 +227,7 @@ src/hiremate_ai/
 - 프로필 저장은 그래프 트랜잭션 하나다. PostgreSQL과 함께 쓰는 곳(분석 원본, 면접 산출물)은 프로필을 먼저 저장하고
   나서 커밋한다. 같은 Agent, 전형의 재저장은 항목을 통째로 바꾸므로 커밋이 실패해 다시 분석해도 어긋나지 않는다.
 - `ai.candidate_profiles`, `ai.profile_items` 테이블은 그래프로 옮기기 전 자료다(`db/profile_legacy.py`).
-  `scripts/profile_graph_load.py`로 옮길 때만 읽고 앱은 쓰지 않는다.
+  `uv run python -m hiremate_ai.db.profile_legacy`로 옮길 때만 읽고 앱은 쓰지 않는다.
 - 여러 Agent가 같이 쓰는 backend 타입은 `contract.py`에 있다. 한 Agent만 쓰는 요청, 응답 타입은 그 Agent 패키지 안(라우터 파일, 패키지 안 여러 모듈이 같이 쓰면 `types.py`)에 두고
   공통 타입을 조합한다. 계약 타입을 바꾸면 `contract/`의 샘플도 고친다 (`contract/README.md`).
 - backend 연동 엔드포인트는 `POST /agents/{agent}/{method}`다. 요청 본문은 backend Agent 인터페이스 메서드의
