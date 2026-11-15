@@ -5,14 +5,20 @@
 
 그래프 모양
     (ApplicationProfile)-[:HAS_CLAIM]->(Claim)-[:SUPPORTED_BY]->(Evidence)-[:FROM_SOURCE]->(Source)
-    (Claim)-[:FROM_SOURCE]->(Source)      근거 문장이 없는 항목
-    (Claim)-[:USES_SKILL]->(Skill)        기술 · 역량 항목
-    (Claim)-[:IN_DOMAIN]->(Domain)        업무 도메인 항목
+    (Claim)-[:FROM_SOURCE]->(Source)                근거 문장이 없는 항목
+    (ApplicationProfile)-[:HAS_EXPERIENCE]->(Experience)<-[:ABOUT_EXPERIENCE]-(Claim)
+    (Claim)-[:USES_SKILL]->(Skill)                  항목에 나온 기술 · 도구
+    (Claim)-[:IN_DOMAIN]->(Domain)                  항목의 업무 분야
 
 - ApplicationProfile: 지원서 하나. 경력 연수, 마지막 회사처럼 조건 검색에 쓰는 값
-- Claim: 프로필 항목 한 줄. 분류, 내용, 확인 상태, 만든 Agent, 전형
+- Claim: 프로필 항목 한 줄. 분류, 내용, 확인 상태, 만든 Agent, 전형, 수행 주체(actor), 한 일의 종류(action)
 - Evidence: 원문에서 찾은 근거 문장. Source: 그 문장이 나온 자료 (이력서, 평가 결과, 면접 답변 등)
-- Skill, Domain: 같은 기업 안에서 항목들이 함께 가리키는 기술 · 도메인. 내용 글을 그대로 이름으로 쓴다
+- Experience: 그 지원서의 회사 · 프로젝트 하나. 같은 경험에서 나온 항목들이 함께 가리킨다. 지원자끼리 합치지 않는다
+- Skill, Domain: 같은 기업 안에서 항목들이 함께 가리키는 기술 · 업무 분야
+
+이름이 같은지는 대소문자와 공백만 무시하고 본다. 표기가 다른 같은 것(카프카와 Kafka)은 합치지 않는다.
+노드의 이름은 처음 저장된 표기다. 기술 이름과 회사 · 프로젝트 이름은 원문에 적힌 것만 들어오고(분석 Agent가 확인),
+업무 분야는 모델이 근거 문장으로 분류한 값이다.
 
 이 모듈의 CandidateProfile, ProfileItem은 그래프에서 읽은 값이다.
 
@@ -82,6 +88,11 @@ class ProfileItem:
     source: str  # 출처 (예: 이력서, 자기소개서, 평가 결과, 면접 답변)
     stage_id: UUID | None  # 평가 · 면접 항목이면 그 전형 ID. 지원서 항목은 None
     created_at: datetime
+    experience: str | None = None  # 이 항목이 속한 회사 · 프로젝트 이름. 없으면 None
+    actor: str | None = None  # 수행 주체 (SELF, TEAM, UNCLEAR). 모르면 None
+    action: str | None = None  # 한 일의 종류 (DEVELOP, OPERATE 등). 없으면 None
+    skills: tuple[str, ...] = ()  # 항목에 나온 기술 · 도구 이름. 이름 순서
+    domains: tuple[str, ...] = ()  # 항목의 업무 분야. 이름 순서
 
 
 @dataclass(frozen=True)

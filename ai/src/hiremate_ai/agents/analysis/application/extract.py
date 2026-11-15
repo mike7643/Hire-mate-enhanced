@@ -33,6 +33,14 @@ EXTRACT_RULES = """- 사실마다 근거 문장(evidence)을 원문 글자 그�
 - actor: 본인이 직접 한 일이면 SELF, 팀 · 조직의 성과면 TEAM, 알 수 없으면 UNCLEAR.
 - kind: EXPERIENCE(업무 경험), PROJECT(프로젝트), SKILL(기술 · 도구), CERTIFICATE(자격증), ACHIEVEMENT(수치 성과),
   ACTIVITY(교육 · 활동), EDUCATION(학력).
+- experience: 그 사실이 어느 회사 · 프로젝트에서 한 일인지 서류에 적혀 있으면 그 이름을 서류 표기 그대로 쓴다.
+  같은 회사 · 프로젝트의 사실에는 같은 이름을 쓴다. 기술 목록 · 자격증처럼 속한 곳이 없으면 비운다.
+  짐작해 붙이지 않는다.
+- action: 그 사실에서 한 일의 종류. DEVELOP(개발 · 구현), DESIGN(설계), OPERATE(운영 · 장애 대응), ANALYZE(분석),
+  TEST(테스트 · 검증), LEAD(주도 · 관리) 가운데 하나다. 어느 것도 아니거나 한 일이 아니면 비운다.
+- skills: 근거 문장에 적힌 기술 · 도구 이름만 하나씩 쓴다. 서류 표기 그대로 쓰고(서류가 '카프카'면 '카프카')
+  문장이나 설명을 붙이지 않는다. 근거 문장에 없는 기술은 쓰지 않는다.
+- domains: 근거 문장으로 알 수 있는 업무 분야를 짧은 명사로 쓴다 (예: 금융, 이커머스, 물류). 알 수 없으면 비운다.
 - periods에는 서류에 적힌 근무 · 활동 기간을 모두 뽑는다. start · end는 YYYY-MM이고 재직 중이면 end를 비운다.
   start · end는 근거 문장에 적힌 날짜만 쓴다. 적혀 있지 않은 날짜를 기간 · 나이 등으로 계산하거나 짐작하지 않는다.
   kind는 EMPLOYMENT(정규 · 계약 재직), INTERN, FREELANCE, PROJECT(교육 · 개인 프로젝트), EDUCATION,
@@ -49,6 +57,10 @@ EXTRACT_SYSTEM = f"""너는 채용 서류 한 건에서 지원자에 관한 사�
 # 모델이 목록 밖의 종류를 쓰면 형식 오류로 분석 전체가 실패했다. 종류는 글로 받고 코드가 목록에 맞춘다
 FACT_KINDS = ("EXPERIENCE", "PROJECT", "SKILL", "CERTIFICATE", "ACHIEVEMENT", "ACTIVITY", "EDUCATION")
 PERIOD_KINDS = ("EMPLOYMENT", "INTERN", "FREELANCE", "PROJECT", "EDUCATION", "OTHER")
+# 한 일의 종류. 목록 밖의 값은 빈 값으로 둔다
+ACTIONS = ("DEVELOP", "DESIGN", "OPERATE", "ANALYZE", "TEST", "LEAD")
+# 기술 · 분야 이름으로 받는 가장 긴 글자 수. 문장을 이름 칸에 쓴 답을 거른다
+NAME_MAX_CHARS = 30
 # 근무로 보는 기간. 날짜가 모두 원문에 적혀 있어야 받는다
 WORK_PERIOD_KINDS = ("EMPLOYMENT", "INTERN", "FREELANCE")
 
@@ -58,6 +70,12 @@ class ExtractedFact(BaseModel):
     statement: str = Field(description="사실 한 문장. 원문보다 부풀리지 않는다")
     actor: Literal["SELF", "TEAM", "UNCLEAR"]
     evidence: list[str] = Field(default=[], description="근거 문장. 원문 글자 그대로")
+    experience: str = Field(
+        default="", description="이 사실이 속한 회사 · 프로젝트 이름. 서류 표기 그대로. 없으면 비운다"
+    )
+    action: str = Field(default="", description=" · ".join(ACTIONS) + " 가운데 하나. 해당 없으면 비운다")
+    skills: list[str] = Field(default=[], description="근거 문장에 적힌 기술 · 도구 이름. 서류 표기 그대로")
+    domains: list[str] = Field(default=[], description="근거 문장으로 알 수 있는 업무 분야. 짧은 명사")
 
 
 class ExtractedPeriod(BaseModel):
@@ -166,6 +184,9 @@ def merge(
     블라인드 채용(blind)이면 출신 학교와 학력 수준(학위 · 학점 등)이 드러나는 사실과 학력 기간을 버린다.
     서류의 학교 이름 · 학점은 저장할 때 "○○"로 가려 두므로, 전공이나 공부한 과목처럼 직무와 관련된 학력 사실은 남긴다.
     근거 문장은 원문 그대로여야 해서 낱말만 가리지 않고 그 사실을 통째로 뺀다 (규칙 7).
+
+    사실을 잇는 값도 확인된 것만 남긴다: 회사 · 프로젝트 이름은 그 서류에, 기술 이름은 근거 문장에 적혀 있어야 한다.
+    업무 분야는 모델의 분류라 원문 낱말과 맞추지 않고, 근거 문장이 있는 사실에만 붙는다.
     """
     facts: list[Fact] = []
     periods: list[Period] = []
@@ -175,6 +196,7 @@ def merge(
             quotes = quotes_in([document], fact.evidence)
             key = _normalize(fact.statement)
             kind = fact.kind.strip().upper()
+            action = fact.action.strip().upper()
             if blind and _mentions_education(fact.statement, quotes):
                 continue
             if quotes and key not in seen:
@@ -185,6 +207,10 @@ def merge(
                         statement=fact.statement.strip(),
                         actor=Actor(fact.actor),
                         quotes=quotes,
+                        experience=_experience(fact.experience, document, blind=blind),
+                        action=action if action in ACTIONS else "",
+                        skills=_names(fact.skills, within=" ".join(quote.sentence for quote in quotes)),
+                        domains=_names(fact.domains),
                     )
                 )
         for period in result.periods:
@@ -210,6 +236,32 @@ def merge(
                     )
                 )
     return facts, periods
+
+
+def _experience(name: str, document: ApplicantDocument, *, blind: bool) -> str:
+    """회사 · 프로젝트 이름. 그 서류에 적혀 있지 않으면 빈 값이다. 블라인드 채용이면 학교 이름을 남기지 않는다."""
+    name = name.strip()
+    needle = _strip(name)
+    if len(needle) < 2 or len(name) > NAME_MAX_CHARS * 2 or (blind and education_term(name)):
+        return ""
+    return name if _find(document.text, needle) is not None else ""
+
+
+def _names(values: Sequence[str], *, within: str | None = None) -> list[str]:
+    """짧은 이름만, 같은 이름은 한 번만 남긴다. within을 주면 그 글에 적힌 이름만 남긴다 (대소문자 · 공백 무시)."""
+    text = _strip(within).casefold() if within is not None else None
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = value.strip()
+        key = _strip(name).casefold()
+        if not key or len(name) > NAME_MAX_CHARS or key in seen:
+            continue
+        if text is not None and key not in text:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
 
 
 def _dates_written(period: ExtractedPeriod, quotes: Sequence[Quote]) -> bool:

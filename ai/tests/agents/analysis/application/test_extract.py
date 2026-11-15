@@ -67,6 +67,42 @@ def test_merge_keeps_only_facts_and_periods_with_real_quotes() -> None:
     assert [(period.company, period.months) for period in periods] == [("한빛카드", 56)]
 
 
+def test_merge_keeps_links_only_when_written_in_the_document() -> None:
+    quote = "Java와 Spring Boot로 개발했습니다."
+
+    def extracted(**links: object) -> ExtractedFacts:
+        fact = ExtractedFact(
+            kind="EXPERIENCE", statement="결제 API를 개발했다", actor="SELF", evidence=[quote], **links
+        )
+        return ExtractedFacts(facts=[fact])
+
+    written = extracted(
+        experience="한빛카드 결제플랫폼팀",
+        action="develop",
+        skills=[
+            "java",
+            "Spring Boot",
+            "Java",
+            "Kafka",
+            "Java와 Spring Boot로 개발한 경험이 풍부하고 여러 서비스에 적용했다",
+        ],
+        domains=["금융", " 금융 ", ""],
+    )
+    invented = extracted(experience="가상은행 차세대 프로젝트", action="주도")
+
+    [fact], _ = merge([DOCUMENT], [written], TODAY)
+    [bare], _ = merge([DOCUMENT], [invented], TODAY)
+
+    # 회사 이름은 서류에, 기술 이름은 근거 문장에 적혀 있어야 남는다. 근거 문장에 없는 Kafka와 문장으로 쓴 값은 버린다
+    assert fact.experience == "한빛카드 결제플랫폼팀"
+    assert fact.skills == ["java", "Spring Boot"]
+    # 업무 분야는 모델의 분류라 원문 낱말과 맞추지 않는다. 같은 이름은 한 번만 남긴다
+    assert fact.domains == ["금융"]
+    assert fact.action == "DEVELOP"
+    # 서류에 없는 프로젝트 이름과 목록 밖의 종류는 비운다
+    assert (bare.experience, bare.action, bare.skills, bare.domains) == ("", "", [], [])
+
+
 SCHOOL_TEXT = (
     "학력\n한빛대학교 컴퓨터공학과 2016.03 ~ 2020.02 졸업\n"
     "한빛대학교 캡스톤 프로젝트에서 결제 앱을 만들었습니다.\n"

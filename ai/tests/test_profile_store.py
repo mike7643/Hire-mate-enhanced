@@ -311,7 +311,7 @@ async def test_keeps_saved_order(
     assert [item.content for item in profile.items] == [item.content for item in sample.items]
 
 
-async def test_stores_claims_with_evidence_source_and_concepts(
+async def test_stores_claims_with_evidence_and_source(
     graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
     applicant = sample_applicants["정유민"]
@@ -323,21 +323,88 @@ async def test_stores_claims_with_evidence_source_and_concepts(
     # 근거 문장이 있는 항목은 근거 문장을 거쳐, 없는 항목은 바로 자료에 이어진다
     assert await count(graph, "(:Claim)-[:SUPPORTED_BY]->(:Evidence)-[:FROM_SOURCE]->(:Source)") == len(with_evidence)
     assert await count(graph, "(:Claim)-[:FROM_SOURCE]->(:Source)") == len(sample.items) - len(with_evidence)
-    # 기술과 도메인 항목은 기업의 기술, 도메인 노드를 가리킨다
-    domains = [item for item in sample.items if item.category == ItemCategory.DOMAIN]
-    skills = [item for item in sample.items if item.category == ItemCategory.SKILL]
-    assert await count(graph, "(:Claim)-[:IN_DOMAIN]->(:Domain)") == len(domains)
-    assert await count(graph, "(:Claim)-[:USES_SKILL]->(:Skill)") == len(skills)
+    # 분석 Agent가 기술, 업무 분야, 경험 이름을 넘기지 않은 항목은 내용 글로 노드를 만들지 않는다
+    assert await count(graph, "(n) WHERE n:Skill OR n:Domain OR n:Experience") == 0
+
+
+def card_items() -> list[NewItem]:
+    """가상 지원자가 카드 결제 프로젝트와 사내 도구 프로젝트에서 한 일 (분석 Agent가 낸 것처럼 만든 항목)."""
+    return [
+        NewItem(
+            category=ItemCategory.EXPERIENCE,
+            content="카드 결제 승인 이벤트 처리 모듈을 Kafka로 개발했다.",
+            source="이력서",
+            experience="카드 결제 시스템",
+            actor="SELF",
+            action="DEVELOP",
+            skills=("Kafka", "Java"),
+            domains=("금융",),
+        ),
+        NewItem(
+            category=ItemCategory.EXPERIENCE,
+            content="팀이 승인 서버를 운영했다.",
+            source="이력서",
+            experience="카드 결제  시스템",  # 공백만 다른 같은 이름
+            actor="TEAM",
+            action="OPERATE",
+            domains=("금융",),
+        ),
+        NewItem(
+            category=ItemCategory.EXPERIENCE,
+            content="사내 배포 도구를 Python으로 만들었다.",
+            source="포트폴리오",
+            experience="사내 배포 도구",
+            actor="SELF",
+            action="DEVELOP",
+            skills=("Python",),
+        ),
+        NewItem(category=ItemCategory.SKILL, content="Redis를 다룰 수 있다.", source="이력서", skills=("Redis",)),
+    ]
+
+
+async def test_links_claims_of_one_experience_with_actor_skills_and_domains(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    applicant = sample_applicants["정유민"]
+
+    profile = await save_sample(graph, sample_company, applicant, card_items())
+
+    by_content = {item.content: item for item in profile.items}
+    kafka = by_content["카드 결제 승인 이벤트 처리 모듈을 Kafka로 개발했다."]
+    assert (kafka.experience, kafka.actor, kafka.action) == ("카드 결제 시스템", "SELF", "DEVELOP")
+    assert (kafka.skills, kafka.domains) == (("Java", "Kafka"), ("금융",))
+    # 경험이 없는 기술 항목은 경험 노드 없이 기술만 가리킨다
+    redis = by_content["Redis를 다룰 수 있다."]
+    assert (redis.experience, redis.actor, redis.skills) == (None, None, ("Redis",))
+    # 공백만 다른 이름은 같은 경험이다. 경험은 그 지원서에 달린다
+    assert await count(graph, "(:ApplicationProfile)-[:HAS_EXPERIENCE]->(:Experience)") == 2
+    assert await count(graph, "(:Claim)-[:ABOUT_EXPERIENCE]->(:Experience {title: '카드 결제 시스템'})") == 2
+
+
+async def test_graph_tells_same_experience_from_separate_ones(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    """관계 검색이 쓸 모양: 같은 경험 안에서 금융 분야와 본인이 쓴 기술이 이어지는지 따라갈 수 있다."""
+    await save_sample(graph, sample_company, sample_applicants["정유민"], card_items())
+    same_experience = (
+        "(:Domain {name: '금융'})<-[:IN_DOMAIN]-(:Claim)-[:ABOUT_EXPERIENCE]->(:Experience)"
+        "<-[:ABOUT_EXPERIENCE]-(:Claim {actor: 'SELF'})-[:USES_SKILL]->(:Skill {name: '%s'})"
+    )
+
+    # Kafka는 금융 경험(카드 결제 시스템)에서 본인이 썼고, Python은 다른 경험(사내 배포 도구)에서 썼다
+    assert await count(graph, same_experience % "Kafka") > 0
+    assert await count(graph, same_experience % "Python") == 0
 
 
 async def test_same_skill_is_one_node_within_company_only(
     graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
 ) -> None:
-    kafka = [NewItem(category=ItemCategory.SKILL, content="Kafka", source="이력서")]
-    spaced = [NewItem(category=ItemCategory.SKILL, content=" kafka ", source="이력서")]
+    kafka = [NewItem(category=ItemCategory.SKILL, content="Kafka를 쓴다.", source="이력서", skills=("Kafka",))]
+    spaced = [NewItem(category=ItemCategory.SKILL, content="kafka 경험", source="이력서", skills=(" kafka ",))]
+    korean = [NewItem(category=ItemCategory.SKILL, content="카프카 경험", source="자기소개서", skills=("카프카",))]
     jung, kim = sample_applicants["정유민"], sample_applicants["김하늘"]
     await save_sample(graph, sample_company, jung, kafka)
-    await save_sample(graph, sample_company, kim, spaced)
+    await save_sample(graph, sample_company, kim, spaced + korean)
     # 다른 기업의 지원자
     await save_profile(
         graph,
@@ -348,8 +415,28 @@ async def test_same_skill_is_one_node_within_company_only(
         items=kafka,
     )
 
-    assert await count(graph, "(:Skill)") == 2
-    assert await count(graph, f"(:Claim)-[:USES_SKILL]->(:Skill {{companyId: '{sample_company.company_id}'}})") == 2
+    company = f"{{companyId: '{sample_company.company_id}'}}"
+    # 대소문자와 공백만 다른 이름은 한 노드고, 표기가 다른 이름(카프카)은 합치지 않는다. 기업끼리는 나눈다
+    assert await count(graph, f"(:Skill {company})") == 2
+    assert (
+        await count(
+            graph, f"(:Claim)-[:USES_SKILL]->(:Skill {{name: 'Kafka', companyId: '{sample_company.company_id}'}})"
+        )
+        == 2
+    )
+    assert await count(graph, "(:Skill {name: 'Kafka'})") == 2
+
+
+async def test_reanalysis_removes_unused_experiences(
+    graph: AsyncDriver, sample_company: CompanyProfile, sample_applicants: dict[str, ApplicantDetail]
+) -> None:
+    applicant = sample_applicants["정유민"]
+    await save_sample(graph, sample_company, applicant, card_items())
+
+    await save_sample(graph, sample_company, applicant, card_items()[2:])
+
+    assert await count(graph, "(:Experience)") == 1
+    assert await count(graph, "(:Experience {title: '사내 배포 도구'})") == 1
 
 
 async def test_reanalysis_removes_old_evidence_and_unused_sources(
@@ -389,6 +476,11 @@ async def test_import_keeps_ids_and_times_and_is_repeatable(graph: AsyncDriver) 
                 source="이력서",
                 stage_id=None,
                 created_at=created,
+                experience="한빛카드",
+                actor="SELF",
+                action="DEVELOP",
+                skills=("Java", "Kafka"),
+                domains=("금융",),
             ),
             ProfileItem(
                 id=uuid4(),
