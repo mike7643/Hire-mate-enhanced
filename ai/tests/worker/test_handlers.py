@@ -281,15 +281,9 @@ async def test_application_worker_reads_each_document_once_and_judges_once(
 
 
 async def test_normalization_job_returns_policy_json_without_indexing() -> None:
-    from hiremate_ai.agents.analysis.application.normalize import LayoutProposal
+    from hiremate_ai.agents.analysis.application.normalize import DocumentPlan
 
-    proposal = LayoutProposal.model_validate(
-        {
-            "schemaVersion": "1.0",
-            "document": {"id": "document", "type": "resume", "title": None, "pageCount": 1},
-            "blocks": [{"type": "paragraph", "pages": [1], "text": "정리된 내용"}],
-        }
-    )
+    proposal = DocumentPlan.model_validate({"title": None, "blocks": [{"type": "paragraph", "segments": ["1"]}]})
     normalizer = FakeLlm(proposal)
     general = FakeLlm()
     handlers = job_handlers(general, MemoryStore(), SESSIONS, normalization_llm_factory=lambda: normalizer)
@@ -306,7 +300,7 @@ async def test_normalization_job_returns_policy_json_without_indexing() -> None:
         }
     )
     assert result["document"]["id"] == document_id
-    assert result["blocks"][0]["text"] == "정리된 내용"
+    assert result["blocks"][0]["text"] == "추출 내용"
     assert "application/index-document" in handlers
     assert len(normalizer.calls) == 1
     assert not general.calls

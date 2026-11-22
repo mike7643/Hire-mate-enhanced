@@ -106,7 +106,7 @@ class DocumentNormalizationTests {
     }
 
     @Test
-    @DisplayName("정제 문서는 화면이 근거 밑줄 자리를 찾는 칸 순서대로 펼치고, 시각 자료 안내는 넣지 않는다")
+    @DisplayName("정제 문서는 화면이 근거 밑줄 자리를 찾는 칸 순서대로 펼치고, 시각 자료 안내와 잡음은 넣지 않는다")
     void readingTextFollowsTheEvidenceSlotOrder() {
         var document = new NormalizedDocument("1.0",
                 new NormalizedDocument.Metadata(UUID.randomUUID(), "resume", "이력서", 2), List.of(
@@ -119,7 +119,8 @@ class DocumentNormalizationTests {
                         new NormalizedDocument.Table("t-1", List.of(2), "기술", List.of("분야", "기술"),
                                 List.of(List.of("백엔드", "Spring Boot"), List.of("DB", "PostgreSQL")), "inferred"),
                         new NormalizedDocument.VisualNotice("v-1", List.of(2), "diagram", "suspected",
-                                "구성도는 원본 PDF에서 확인해 주세요.")));
+                                "구성도는 원본 PDF에서 확인해 주세요."),
+                        new NormalizedDocument.Artifact("a-1", List.of(2), "page_number", "2")));
 
         assertThat(document.readingText()).isEqualTo("""
                 이력서

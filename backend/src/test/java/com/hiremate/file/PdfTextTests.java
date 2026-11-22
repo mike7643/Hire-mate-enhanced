@@ -1,7 +1,9 @@
 package com.hiremate.file;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
+import java.awt.Color;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -70,6 +72,65 @@ class PdfTextTests {
             });
             assertThat(parsed.imageCount()).isZero();
             assertThat(parsed.formCount()).isZero();
+        }
+    }
+
+    @Test
+    void extractsPaintedGridRulesInTextCoordinates() throws Exception {
+        try (PDDocument document = new PDDocument()) {
+            PDPage page = new PDPage();
+            document.addPage(page);
+            try (PDPageContentStream content = new PDPageContentStream(document, page)) {
+                content.beginText();
+                content.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 12);
+                content.newLineAtOffset(50, 680);
+                content.showText("Cell text");
+                content.endText();
+                content.moveTo(40, 700);
+                content.lineTo(200, 700);
+                content.stroke();
+                content.addRect(40, 650, 0.5f, 50);
+                content.fill();
+                content.addRect(40, 650, 160, 50);
+                content.fill();
+                content.setLineDashPattern(new float[] {2, 2}, 0);
+                content.moveTo(150, 700);
+                content.lineTo(150, 650);
+                content.stroke();
+            }
+            assertThat(PdfText.parse(save(document)).pages().getFirst().gridLines()).containsExactly(
+                    new PdfText.GridLine(40, 92, 200, 92), new PdfText.GridLine(40.25f, 92, 40.25f, 142));
+        }
+    }
+
+    @Test
+    void recordsFontSizeAndFillColorPerSpan() throws Exception {
+        try (PDDocument document = new PDDocument()) {
+            PDPage page = new PDPage();
+            document.addPage(page);
+            try (PDPageContentStream content = new PDPageContentStream(document, page)) {
+                PDType1Font font = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+                content.beginText();
+                content.setFont(font, 11);
+                content.setNonStrokingColor(new Color(0xE1, 0x57, 0x59));
+                content.newLineAtOffset(40, 700);
+                content.showText("Headline");
+                content.setFont(font, 9.6f);
+                content.setNonStrokingColor(new Color(0x33, 0x33, 0x33));
+                content.newLineAtOffset(0, -30);
+                content.showText("Body text");
+                content.setFont(font, 0.8f);
+                content.setNonStrokingColor(Color.WHITE);
+                content.newLineAtOffset(0, -30);
+                content.showText("Hidden instruction");
+                content.endText();
+            }
+            var spans = PdfText.parse(save(document)).pages().getFirst().spans();
+            assertThat(spans).extracting(PdfText.TextSpan::text, PdfText.TextSpan::size, PdfText.TextSpan::color)
+                    .containsExactly(
+                            tuple("Headline", 11f, "#e15759"),
+                            tuple("Body text", 9.6f, "#333333"),
+                            tuple("Hidden instruction", 0.8f, "#ffffff"));
         }
     }
 

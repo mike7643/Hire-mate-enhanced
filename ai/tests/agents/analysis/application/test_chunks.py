@@ -84,3 +84,74 @@ def test_does_not_index_personal_data_even_as_context() -> None:
     assert "결제 시스템을 개발했다." in chunks[0].text
     assert "홍길동" not in chunks[0].text
     assert all("test@example.com" not in chunk.text and "한빛대학교" not in chunk.text for chunk in chunks)
+
+
+def test_artifacts_are_kept_in_the_document_but_not_indexed() -> None:
+    document = NormalizedDocument.model_validate(
+        {
+            "schemaVersion": "1.0",
+            "document": {"id": str(uuid4()), "type": "resume", "title": None, "pageCount": 1},
+            "blocks": [
+                {"id": "p1", "type": "paragraph", "pages": [1], "text": "소성·수세·코팅 공정을 개발했다."},
+                {"id": "a1", "type": "artifact", "pages": [1], "role": "page_number", "text": "- 1 -"},
+            ],
+        }
+    )
+    chunks = document_chunks(document, blind=False, applicant_name="김민지")
+    assert [chunk.text for chunk in chunks] == ["소성·수세·코팅 공정을 개발했다."]
+
+
+def test_addresses_and_contact_sections_are_not_indexed_but_work_places_are() -> None:
+    document = NormalizedDocument.model_validate(
+        {
+            "schemaVersion": "1.0",
+            "document": {"id": str(uuid4()), "type": "resume", "title": None, "pageCount": 1},
+            "blocks": [
+                {
+                    "id": "t1",
+                    "type": "table",
+                    "pages": [1],
+                    "title": None,
+                    "headers": [],
+                    "rows": [
+                        ["지원분야", "생산관리"],
+                        ["주소", "(우: 40653) 인천 부평구 라온길 178, 1101호"],
+                        ["경력", "11년 6개월", "주소", "인천 부평구"],
+                    ],
+                    "reconstruction": "inferred",
+                },
+                {
+                    "id": "t2",
+                    "type": "table",
+                    "pages": [1],
+                    "title": None,
+                    "headers": ["회사", "거주지"],
+                    "rows": [["새솔정밀", "경남 창원시"]],
+                    "reconstruction": "inferred",
+                },
+                {
+                    "id": "s1",
+                    "type": "section",
+                    "title": "CONTACT",
+                    "pages": [1],
+                    "blocks": [
+                        {
+                            "id": "l1",
+                            "type": "list",
+                            "pages": [1],
+                            "items": [{"id": "i1", "text": "경남 창원시", "pages": [1], "items": []}],
+                        }
+                    ],
+                },
+                {"id": "p1", "type": "paragraph", "pages": [1], "text": "주소: 서울 마포구 늘봄로 1"},
+                {"id": "p2", "type": "paragraph", "pages": [1], "text": "인천 공장에서 사출 생산 실적을 관리했다."},
+            ],
+        }
+    )
+    chunks = [chunk.text for chunk in document_chunks(document, blind=False, applicant_name="윤주연")]
+    assert chunks == [
+        "지원분야 | 생산관리",
+        "경력 | 11년 6개월",
+        "회사: 새솔정밀",
+        "인천 공장에서 사출 생산 실적을 관리했다.",
+    ]

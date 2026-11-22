@@ -183,15 +183,9 @@ def test_candidate_card_reanalyzes_when_criteria_changed(
 def test_normalize_route_returns_json(store: MemoryStore) -> None:
     from uuid import uuid4
 
-    from hiremate_ai.agents.analysis.application.normalize import LayoutProposal
+    from hiremate_ai.agents.analysis.application.normalize import DocumentPlan
 
-    proposal = LayoutProposal.model_validate(
-        {
-            "schemaVersion": "1.0",
-            "document": {"id": "document", "type": "resume", "title": None, "pageCount": 1},
-            "blocks": [{"type": "paragraph", "pages": [1], "text": "정돈된 본문"}],
-        }
-    )
+    proposal = DocumentPlan.model_validate({"title": None, "blocks": [{"type": "paragraph", "segments": ["1"]}]})
     app.dependency_overrides[get_document_normalization_llm] = lambda: FakeLlm(proposal)
     document_id = str(uuid4())
     response = TestClient(app).post(
@@ -208,4 +202,4 @@ def test_normalize_route_returns_json(store: MemoryStore) -> None:
     )
     assert response.status_code == 200
     assert response.json()["document"]["id"] == document_id
-    assert response.json()["blocks"][0]["text"] == "정돈된 본문"
+    assert response.json()["blocks"][0]["text"] == "본문"

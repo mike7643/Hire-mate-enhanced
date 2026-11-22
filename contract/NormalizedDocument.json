@@ -70,6 +70,15 @@
           "message": "시각 자료는 원본 PDF를 확인해 주세요."
         }
       ]
+    },
+    {
+      "id": "b6",
+      "type": "artifact",
+      "pages": [
+        1
+      ],
+      "role": "page_number",
+      "text": "1"
     }
   ]
 }
