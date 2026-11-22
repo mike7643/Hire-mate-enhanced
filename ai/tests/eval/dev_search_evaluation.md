@@ -13,13 +13,13 @@
 
 ```bash
 cd ai
-UV_CACHE_DIR=/tmp/hiremate-uv LANGSMITH_TRACING=false uv run pytest -q tests/eval/test_dev_search_eval.py
+UV_CACHE_DIR=/tmp/hiremate-uv LANGFUSE_TRACING_ENABLED=false uv run pytest -q tests/eval/test_dev_search_eval.py
 ```
 
 Docker가 필요하다. 실제 모델로 Root를 평가하려면 모델 설정 후 아래 명령을 실행한다. 가상 지원서 본문이 설정된 모델 제공자에게 전달된다. 검색 조건, 후보, 최종 결과와 지정된 사례의 누락 여부, 시간을 세 번씩 출력한다. 최종 결과의 이름만으로 근거 적합성을 확인할 수는 없다.
 
 ```bash
-UV_CACHE_DIR=/tmp/hiremate-uv LANGSMITH_TRACING=false LLM_EVAL=true uv run pytest -s -q tests/eval/test_dev_search_eval.py
+UV_CACHE_DIR=/tmp/hiremate-uv LANGFUSE_TRACING_ENABLED=false LLM_EVAL=true uv run pytest -s -q tests/eval/test_dev_search_eval.py
 ```
 
 이 평가는 문서와 프로필 스냅샷을 테스트 DB에 넣고 지원자 목록을 재구성한다. 실제 개발 화면의 선택 영역, 전형 상태, 점수와 대화 기록은 재현하지 않는다. 모든 지원자가 검색 가능한 상태이며 각 요청은 독립적으로 실행된다.

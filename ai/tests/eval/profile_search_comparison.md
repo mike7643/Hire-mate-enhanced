@@ -20,7 +20,7 @@
 
 ```bash
 cd ai
-LANGSMITH_TRACING=false LLM_EVAL=true NCS_EMBED_URL=http://127.0.0.1:8002 uv run pytest -s -q tests/eval/test_profile_embedding_eval.py
+LANGFUSE_TRACING_ENABLED=false LLM_EVAL=true NCS_EMBED_URL=http://127.0.0.1:8002 uv run pytest -s -q tests/eval/test_profile_embedding_eval.py
 ```
 
 실제 모델 평가에서는 가상 지원서 내용이 설정된 모델 제공자에게 전송된다. 임베딩 서비스는 내부망에서 실행한다.
@@ -132,7 +132,7 @@ uv run python scripts/profile_embeddings.py --company-id <기업-UUID> --recruit
 
 ```bash
 cd ai
-LANGSMITH_TRACING=false LLM_EVAL=true NCS_EMBED_URL=http://127.0.0.1:8002 uv run pytest -s -q tests/eval/test_dev_search_ten_eval.py::test_ten_candidate_search_with_real_model
+LANGFUSE_TRACING_ENABLED=false LLM_EVAL=true NCS_EMBED_URL=http://127.0.0.1:8002 uv run pytest -s -q tests/eval/test_dev_search_ten_eval.py::test_ten_candidate_search_with_real_model
 ```
 
 같은 스냅샷의 유사도 실험은 위 명령의 테스트 이름을 `test_ten_candidate_similarity_thresholds`로 바꿔 실행한다. 문서를 새로 분석하는 동일 실행 비교는 `test_ten_document_extraction_with_real_model`로 실행하며, 더 많은 실제 모델 호출이 발생한다.
