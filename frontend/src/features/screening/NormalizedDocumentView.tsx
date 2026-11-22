@@ -67,7 +67,7 @@ function PagedBlocks({ blocks }: { blocks: Block[] }) {
   const shown: { block: Block; first: number; turned: boolean }[] = []
   let page = 1
   for (const block of blocks) {
-    if (notices.has(block.id)) continue
+    if (notices.has(block.id) || block.type === 'artifact') continue
     const first = Math.min(...block.pages)
     const turned = Number.isFinite(first) && first > page
     if (turned) page = first
@@ -108,7 +108,7 @@ function TopicCard({ block }: { block: Extract<Block, { type: 'section' }> }) {
 function Children({ blocks }: { blocks: Block[] }) {
   const { notices } = useContext(ViewContext)
   return blocks
-    .filter((block) => !notices.has(block.id))
+    .filter((block) => !notices.has(block.id) && block.type !== 'artifact')
     .map((block) => <BlockView key={block.id} block={block} />)
 }
 
@@ -155,6 +155,8 @@ function BlockView({ block }: { block: Block }) {
           {VISUAL_LABELS[block.visualType] ?? '시각 자료'} · {visualSubject(block.message)}
         </Notice>
       )
+    case 'artifact':
+      return null
   }
 }
 

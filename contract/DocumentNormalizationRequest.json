@@ -15,11 +15,14 @@
           "text": "프로젝트",
           "x": 10.0,
           "y": 20.0,
-          "endX": 45.0
+          "endX": 45.0,
+          "size": 11.0,
+          "color": "#1b1b1b"
         }
       ],
       "imageCount": 1,
-      "formCount": 0
+      "formCount": 0,
+      "gridLines": [{"x1": 10.0, "y1": 30.0, "x2": 100.0, "y2": 30.0}]
     }
   ]
 }

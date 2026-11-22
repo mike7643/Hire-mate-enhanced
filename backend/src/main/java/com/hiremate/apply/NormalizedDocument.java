@@ -13,7 +13,7 @@ import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-/** 제출 PDF를 정책에 따라 정리한 페이지 기반 문서. */
+/** 제출 PDF의 원문 글자에 구조를 입힌 페이지 기반 문서. 글은 원문 그대로이고 공백과 줄바꿈만 다를 수 있다. */
 public record NormalizedDocument(String schemaVersion, Metadata document, List<Block> blocks) {
     public NormalizedDocument {
         if (!"1.0".equals(schemaVersion)) {
@@ -25,7 +25,6 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
         for (Block block : blocks) {
             validate(block, document.pageCount(), ids);
         }
-        checkText(document.title());
     }
 
     static void validateMetadata(UUID documentId, int revision, DocumentType type) {
@@ -57,6 +56,8 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
                     table.rows().stream().map(row -> row.stream().map(mask).toList()).toList(), table.reconstruction());
             case VisualNotice notice -> new VisualNotice(notice.id(), notice.pages(), notice.visualType(),
                     notice.detection(), mask.apply(notice.message()));
+            case Artifact artifact -> new Artifact(artifact.id(), artifact.pages(), artifact.role(),
+                    mask.apply(artifact.text()));
         };
     }
 
@@ -68,7 +69,8 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
     /**
      * 읽는 순서대로 펼친 글. 정제를 마친 서류는 PDF에서 뽑은 글 대신 이 글을 AI에 보낸다 (ApplicantDocument.text).
      * 순서는 화면이 근거 밑줄 자리를 찾는 칸 순서(문서 제목, 소제목, 문단, 목록 항목, 표 제목 · 머리글 · 칸)와 같아, 이 글에서
-     * 뽑은 근거 문장을 화면도 찾는다. 시각 자료 안내(visual_notice)는 지원자가 쓴 글이 아니라 넣지 않는다.
+     * 뽑은 근거 문장을 화면도 찾는다. 시각 자료 안내(visual_notice)는 지원자가 쓴 글이 아니고, 잡음(artifact)은 쪽 번호와
+     * 장식이라 넣지 않는다.
      */
     public String readingText() {
         return Stream.concat(Stream.of(document.title()), blocks.stream().flatMap(NormalizedDocument::lines))
@@ -85,6 +87,7 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
             case Table table -> Stream.concat(Stream.of(table.title(), String.join(" | ", table.headers())),
                     table.rows().stream().map(row -> String.join(" | ", row)));
             case VisualNotice notice -> Stream.empty();
+            case Artifact artifact -> Stream.empty();
         };
     }
 
@@ -92,12 +95,6 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
     private static Stream<String> items(List<ListItem> items, int depth) {
         return items.stream().flatMap(item -> Stream.concat(Stream.of("  ".repeat(depth) + "- " + item.text()),
                 items(item.items(), depth + 1)));
-    }
-
-    private static void checkText(String text) {
-        if (text != null && text.indexOf((char) 183) >= 0) {
-            throw new IllegalArgumentException("Unprocessed character in normalized document");
-        }
     }
 
     private static void validateItem(String id, List<Integer> pages, int pageCount, Set<String> ids) {
@@ -109,25 +106,15 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
 
     private static void validateListItem(ListItem item, int pageCount, Set<String> ids) {
         validateItem(item.id(), item.pages(), pageCount, ids);
-        checkText(item.text());
         item.items().forEach(child -> validateListItem(child, pageCount, ids));
     }
 
     private static void validate(Block block, int pageCount, Set<String> ids) {
         validateItem(block.id(), block.pages(), pageCount, ids);
-        switch (block) {
-            case Section section -> {
-                checkText(section.title());
-                section.blocks().forEach(child -> validate(child, pageCount, ids));
-            }
-            case Paragraph paragraph -> checkText(paragraph.text());
-            case Listing listing -> listing.items().forEach(item -> validateListItem(item, pageCount, ids));
-            case Table table -> {
-                checkText(table.title());
-                table.headers().forEach(NormalizedDocument::checkText);
-                table.rows().forEach(row -> row.forEach(NormalizedDocument::checkText));
-            }
-            case VisualNotice notice -> checkText(notice.message());
+        if (block instanceof Section section) {
+            section.blocks().forEach(child -> validate(child, pageCount, ids));
+        } else if (block instanceof Listing listing) {
+            listing.items().forEach(item -> validateListItem(item, pageCount, ids));
         }
     }
 
@@ -146,9 +133,10 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
             @JsonSubTypes.Type(value = Paragraph.class, name = "paragraph"),
             @JsonSubTypes.Type(value = Listing.class, name = "list"),
             @JsonSubTypes.Type(value = Table.class, name = "table"),
-            @JsonSubTypes.Type(value = VisualNotice.class, name = "visual_notice")
+            @JsonSubTypes.Type(value = VisualNotice.class, name = "visual_notice"),
+            @JsonSubTypes.Type(value = Artifact.class, name = "artifact")
     })
-    public sealed interface Block permits Section, Paragraph, Listing, Table, VisualNotice {
+    public sealed interface Block permits Section, Paragraph, Listing, Table, VisualNotice, Artifact {
         String id();
 
         List<Integer> pages();
@@ -203,6 +191,17 @@ public record NormalizedDocument(String schemaVersion, Metadata document, List<B
             if (visualType == null || !Set.of("image", "chart", "diagram", "unknown").contains(visualType)
                     || !"suspected".equals(detection)) {
                 throw new IllegalArgumentException("Invalid visual notice");
+            }
+        }
+    }
+
+    /** 쪽 번호, 반복 머리글과 바닥글, 장식 글자. 원문 보존을 위해 남기되 화면, 분석, 검색에는 쓰지 않는다. */
+    public record Artifact(String id, List<Integer> pages, String role, String text) implements Block {
+        public Artifact {
+            pages = List.copyOf(pages);
+            Objects.requireNonNull(text);
+            if (role == null || !Set.of("page_number", "header", "footer", "decoration").contains(role)) {
+                throw new IllegalArgumentException("Invalid artifact role");
             }
         }
     }

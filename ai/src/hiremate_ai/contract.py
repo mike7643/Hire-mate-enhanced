@@ -476,10 +476,26 @@ class JobResult(ContractModel):
 
 
 class PdfTextSpan(ContractModel):
+    """파서가 뽑은 글자 조각. size는 pt, color는 채우기 색(#rrggbb)이고 모르면 None이다.
+
+    모양은 제목과 본문을 가르는 단서다. 흰 글자나 아주 작은 글자도 원문이라 그대로 받는다.
+    """
+
     text: str
     x: float
     y: float
     end_x: float
+    size: float | None = None
+    color: str | None = None
+
+
+class PdfGridLine(ContractModel):
+    """PDF에서 실제 그린 격자선 후보. 좌표계는 글자 조각과 같다."""
+
+    x1: float = Field(allow_inf_nan=False)
+    y1: float = Field(allow_inf_nan=False)
+    x2: float = Field(allow_inf_nan=False)
+    y2: float = Field(allow_inf_nan=False)
 
 
 class PdfPage(ContractModel):
@@ -489,6 +505,7 @@ class PdfPage(ContractModel):
     spans: list[PdfTextSpan] = Field(default_factory=list)
     image_count: int = Field(default=0, ge=0)
     form_count: int = Field(default=0, ge=0)
+    grid_lines: list[PdfGridLine] = Field(default_factory=list, max_length=512)
 
 
 NormalizedDocumentType = Literal[DocumentType.RESUME, DocumentType.COVER_LETTER, DocumentType.PORTFOLIO]
@@ -548,8 +565,19 @@ class DocumentVisualNotice(ContractModel):
     message: str
 
 
+class DocumentArtifact(ContractModel):
+    """쪽 번호, 반복 머리글과 바닥글, 장식 글자. 원문 보존을 위해 남기되 화면, 분석, 검색에는 쓰지 않는다."""
+
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1)
+    type: Literal["artifact"]
+    pages: list[int]
+    role: Literal["page_number", "header", "footer", "decoration"]
+    text: str
+
+
 DocumentBlock = Annotated[
-    DocumentSection | DocumentParagraph | DocumentList | DocumentTable | DocumentVisualNotice,
+    DocumentSection | DocumentParagraph | DocumentList | DocumentTable | DocumentVisualNotice | DocumentArtifact,
     Field(discriminator="type"),
 ]
 DocumentSection.model_rebuild()
@@ -564,7 +592,7 @@ class DocumentMetadata(ContractModel):
 
 
 class NormalizedDocument(ContractModel):
-    """정책에 따라 정리한 문서. 출처 번호는 PDF 페이지를 가리킨다."""
+    """원문 글자에 구조를 입힌 문서. 글은 파서가 뽑은 원문 그대로고, 출처 번호는 PDF 페이지를 가리킨다."""
 
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal["1.0"] = "1.0"
@@ -573,8 +601,6 @@ class NormalizedDocument(ContractModel):
 
     @model_validator(mode="after")
     def validate_structure(self) -> "NormalizedDocument":
-        if "\u00b7" in self.model_dump_json():
-            raise ValueError("Unprocessed character in normalized document")
         seen: set[str] = set()
 
         def check(item: DocumentBlock | DocumentListItem) -> None:

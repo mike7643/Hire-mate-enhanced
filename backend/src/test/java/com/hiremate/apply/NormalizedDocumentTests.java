@@ -17,6 +17,21 @@ class NormalizedDocumentTests {
     }
 
     @Test
+    void keepsOriginalCharactersAndArtifacts() {
+        var document = new NormalizedDocument("1.0", new NormalizedDocument.Metadata(UUID.randomUUID(), "resume",
+                "아라첨단소재 · 주임연구원", 1), List.of(
+                        new NormalizedDocument.Paragraph("block-0001", List.of(1), "소성·수세·코팅 공정"),
+                        new NormalizedDocument.Artifact("block-0002", List.of(1), "page_number", "1")));
+        assertThat(document.readingText()).isEqualTo("아라첨단소재 · 주임연구원\n소성·수세·코팅 공정");
+    }
+
+    @Test
+    void rejectsUnknownArtifactRole() {
+        assertThatThrownBy(() -> new NormalizedDocument.Artifact("block-0001", List.of(1), "body", "본문"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void rejectsPagesOutsideTheDocument() {
         var metadata = new NormalizedDocument.Metadata(UUID.randomUUID(), "resume", null, 1);
         assertThatThrownBy(() -> new NormalizedDocument("1.0", metadata,

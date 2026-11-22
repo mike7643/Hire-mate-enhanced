@@ -28,7 +28,15 @@ export type VisualNoticeBlock = Pages & {
   visualType: 'image' | 'chart' | 'diagram' | 'unknown'
   message: string
 }
-export type Block = SectionBlock | ParagraphBlock | ListBlock | TableBlock | VisualNoticeBlock
+/** 쪽 번호, 반복 머리글과 바닥글, 장식 글자. 원문 보존용이라 화면에 그리지 않는다 */
+export type ArtifactBlock = Pages & {
+  id: string
+  type: 'artifact'
+  role: 'page_number' | 'header' | 'footer' | 'decoration'
+  text: string
+}
+export type Block =
+  SectionBlock | ParagraphBlock | ListBlock | TableBlock | VisualNoticeBlock | ArtifactBlock
 
 export type NormalizedDocument = {
   schemaVersion: string

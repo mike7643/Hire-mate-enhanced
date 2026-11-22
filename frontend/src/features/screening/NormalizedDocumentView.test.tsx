@@ -76,6 +76,20 @@ describe('정제 문서(서류 원문) 보기', () => {
     expect(screen.getByText('도식 · 구조도')).toBeInTheDocument()
   })
 
+  it('쪽 번호와 장식 같은 잡음(artifact)은 그리지 않고 근거 자리에도 넣지 않는다', () => {
+    const withArtifact: NormalizedDocument = {
+      ...document,
+      blocks: [
+        ...document.blocks,
+        { id: 'a1', type: 'artifact', pages: [2], role: 'page_number', text: '- 2 -' },
+      ],
+    }
+    const { container } = render(<NormalizedDocumentView document={withArtifact} />)
+
+    expect(container.textContent).not.toContain('- 2 -')
+    expect(slots(withArtifact).map(({ text }) => text)).not.toContain('- 2 -')
+  })
+
   it('시각 자료 안내는 자료 이름만 남긴다', () => {
     expect(
       visualSubject(
