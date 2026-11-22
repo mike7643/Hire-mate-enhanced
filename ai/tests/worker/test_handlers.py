@@ -1,12 +1,12 @@
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 from application_context import YUMIN_SUMMARY, make_posting, make_rubric, scripted, yumin_script
 from neo4j import AsyncDriver
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hiremate_ai.agents.analysis.application.types import ApplicationReview, ScreeningRubric
@@ -19,6 +19,7 @@ from hiremate_ai.contract import ApplicantDetail, PostingContent
 from hiremate_ai.db.analysis_store import AnalysisArtifactStore
 from hiremate_ai.db.profile import ProfileStatus
 from hiremate_ai.db.profile_store import ProfileScopeError
+from hiremate_ai.llm import tracing
 from hiremate_ai.llm.client import LlmClient
 from hiremate_ai.llm.fake import FakeLlm
 from hiremate_ai.worker import handlers as worker_handlers
@@ -81,17 +82,21 @@ async def test_only_application_uses_the_dedicated_batch_model(
 
 
 async def test_each_job_is_one_trace(
-    sample_applicants: dict[str, ApplicantDetail], sample_posting: PostingContent, langsmith: MagicMock
+    sample_applicants: dict[str, ApplicantDetail], sample_posting: PostingContent, langfuse: InMemorySpanExporter
 ) -> None:
     handle = job_handlers(scripted(yumin_script()), MemoryStore(), SESSIONS)["application/analyze"]
 
     await handle(payload(sample_applicants["정유민"], sample_posting, make_rubric()))
 
-    created = [call.kwargs for call in langsmith.mock_calls if call[0] == "create_run"]
-    root = created[0]
-    assert root["name"] == "application/analyze"
+    tracing._client().flush()
+    created = langfuse.get_finished_spans()
+    roots = [span for span in created if span.parent is None]
+    assert len(roots) == 1
+    root = roots[0]
+    assert root.name == "application/analyze"
+    assert root.context is not None
     assert len(created) > 1
-    assert all(run["trace_id"] == root["id"] for run in created)
+    assert all(span.context is not None and span.context.trace_id == root.context.trace_id for span in created)
 
 
 async def test_rubric_of_another_recruitment_is_permanent(

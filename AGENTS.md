@@ -164,7 +164,7 @@ src/hiremate_ai/
 │       ├── communication/      안내 초안
 │       └── report/             최종 리포트 초안
 ├── tools/                      Agent 도구
-├── llm/                        모델 클라이언트 (LlmClient, 도구 루프 Agent, 테스트용 FakeLlm), 프롬프트 자료 블록, 호출 로그, LangSmith 추적
+├── llm/                        모델 클라이언트 (LlmClient, 도구 루프 Agent, 테스트용 FakeLlm), 프롬프트 자료 블록, 호출 로그, Langfuse 추적
 ├── db/                         ai 스키마 (Base, 세션), 지원자 프로필 그래프 (Neo4j 연결, 저장과 조회)
 │   └── migrations/             Alembic 리비전
 ├── ncs_search/                 NCS 참고 검색: 표 적재, pgvector 검색, 질의 임베딩 서비스 (uv run --group ncs python -m hiremate_ai.ncs_search)
@@ -236,9 +236,12 @@ src/hiremate_ai/
   모델이 쓴 문장을 검사 전에 보내지 않는다.
 - 모델은 `llm.client`의 `LlmClient`로만 부른다. 호출은 `ai.llm_calls`에 기록된다. 라우터는 `LlmDep`으로 받고,
   테스트는 `app.dependency_overrides[get_llm]`에 `FakeLlm`을 넣는다. 실제 모델 연결 설정은 `ai/.env.example`에 있다.
-- `LANGSMITH_TRACING=true`면 모델 호출이 LangSmith에도 기록된다. `LlmDep`을 받는 요청 하나, 워커 작업 하나가 기록 하나다.
-  지원 문서 본문이 외부 서버로 나가므로 가상 지원자로 개발, 평가할 때만 켠다. 단위 테스트는 켜 두어도 보내지 않는다.
-- Root 그래프는 ai 폴더에서 `uv run langgraph dev`로 띄워 LangSmith Studio에서 노드와 갈래를 보며 실행할 수 있다
+- `LANGFUSE_TRACING_ENABLED=true`면 모델 호출이 지정한 Langfuse 서버에도 기록된다. 기본 주소는 로컬 자체 호스팅
+  (`LANGFUSE_BASE_URL=http://localhost:3000`)이고 공개 키와 비밀 키를 명시해야 한다. `LlmDep`을 받는 요청 하나,
+  워커 작업 하나가 기록 하나다. 지원 문서 본문도 기록되므로 가상 지원자로 개발, 평가할 때만 켠다.
+  단위 테스트는 외부로 보내지 않고 실제 SDK의 span을 메모리에 모은다. LangChain 기본 추적기로 이중 전송하지 않는다.
+  로컬 서버는 `compose.langfuse.yaml`로 업무 DB와 분리해 띄운다. 운영에 이 로컬 구성을 그대로 배포하지 않는다.
+- Root 그래프는 ai 폴더에서 `uv run langgraph dev`로 띄워 로컬 그래프 디버거에서 노드와 갈래를 보며 실행할 수 있다
   (`langgraph.json`, `agents/root/studio.py`). 모델은 `ai/.env`를 쓰고, 지원자는 `contract/ChatContext.json`의 가상 샘플이다.
   Root 그래프의 갈래 함수는 반환 타입에 갈 수 있는 노드를 `Literal`로 적는다. 적지 않으면 Studio 그림에 화살표가 빠진다.
 - 한 번 묻고 형식대로 받는 분석과 생성, 검색 근거 재확인, Root의 근거 검토는 `structured`를 쓴다. Root의 계획은

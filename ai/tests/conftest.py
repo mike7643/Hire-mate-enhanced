@@ -2,13 +2,17 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from uuid import uuid4
 
+import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
-from langsmith import Client, tracing_context
+from langfuse import Langfuse
+from langsmith import tracing_context
 from neo4j import AsyncDriver, AsyncGraphDatabase
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import SecretStr, TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from testcontainers.community.neo4j import Neo4jContainer
@@ -41,16 +45,17 @@ def pytest_asyncio_loop_factories(
 
 
 @pytest.fixture(autouse=True)
-def langsmith_tracing(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """LangSmith 추적은 실제 모델 평가(tests/eval)만 LANGSMITH_TRACING을 따른다.
+def langfuse_tracing(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Langfuse 추적은 실제 모델 평가(tests/eval)만 LANGFUSE_TRACING_ENABLED를 따른다.
 
     다른 테스트는 ai/.env나 환경 변수로 추적을 켜 두어도 기록을 보내지 않는다.
     """
-    if request.path.parent.name == "eval":
+    if "eval" in request.path.relative_to(AI_DIR / "tests").parts and settings.llm_eval:
         with traced():
             yield
         return
-    monkeypatch.setattr(settings, "langsmith_tracing", False)
+    monkeypatch.setattr(settings, "langfuse_tracing_enabled", False)
+
     with tracing_context(enabled=False):
         yield
 
@@ -65,12 +70,34 @@ def isolate_poster_provider(request: pytest.FixtureRequest, monkeypatch: pytest.
 
 
 @pytest.fixture
-def langsmith(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """추적을 켜고 LangSmith 서버 대신 받은 기록(create_run, update_run 호출)을 모으는 클라이언트를 넣는다."""
-    client = MagicMock(spec=Client)
-    monkeypatch.setattr(settings, "langsmith_tracing", True)
+def langfuse(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    """실제 SDK가 만든 span을 메모리에 모은다. 모델과 Langfuse 서버에는 연결하지 않는다."""
+
+    def no_http(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"단위 테스트의 외부 요청: {request.url}")
+
+    exporter = InMemorySpanExporter()
+    public_key = f"pk-test-{uuid4()}"
+    # SDK는 명시적 생성자 인자와 별개로 이 환경 변수를 다시 확인한다.
+    monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "true")
+    client = Langfuse(
+        public_key=public_key,
+        secret_key="test-only",
+        base_url="http://langfuse.test",
+        environment="test",
+        tracing_enabled=True,
+        sample_rate=1,
+        tracer_provider=TracerProvider(),
+        span_exporter=exporter,
+        httpx_client=httpx.Client(transport=httpx.MockTransport(no_http)),
+    )
+    monkeypatch.setattr(settings, "langfuse_tracing_enabled", True)
+    monkeypatch.setattr(settings, "langfuse_public_key", public_key)
     monkeypatch.setattr(tracing, "_client", lambda: client)
-    return client
+    try:
+        yield exporter
+    finally:
+        client.shutdown()
 
 
 def _alembic_config(database_url: str | None = None) -> Config:
