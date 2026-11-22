@@ -209,3 +209,49 @@ HireMate/
 ├── compose.yaml           로컬 PostgreSQL, Neo4j, Redis, Mailpit
 └── compose.production.yaml  운영 서비스 구성
 ```
+
+## AI 추적과 토큰 사용량 (Langfuse)
+
+요청 하나와 워커 작업 하나를 trace로 묶고, LangGraph 노드와 모델/도구 호출을 하위 단계로 기록한다.
+모델 응답의 입력/출력 토큰, 모델 이름, 처리 시간과 오류를 확인할 수 있다.
+기존 `ai.llm_calls` 업무용 호출 로그는 그대로 유지한다.
+
+### 로컬 자체 호스팅
+
+업무 DB와 별도의 PostgreSQL, ClickHouse, Redis, MinIO를 사용한다. 화면과 미디어 포트는 로컬에만 연다.
+다음 구성은 개발용이며 `compose.production.yaml`에 합치지 않는다.
+
+1. 저장소 루트에서 `langfuse.env.example`을 `.env.langfuse`로 복사한다.
+2. 빈 값에 서로 다른 난수를 채운다. `openssl rand -hex 32`로 각 값을 생성할 수 있다.
+   `LANGFUSE_ENCRYPTION_KEY`는 반드시 64자리 hex다. 이 파일은 Git에서 제외된다.
+3. 서버를 실행한다.
+
+   ```bash
+   docker compose --env-file .env.langfuse -f compose.langfuse.yaml up -d --wait
+   ```
+
+4. `http://localhost:3000`에서 가입하고 프로젝트를 만든 뒤 프로젝트 API 키를 발급한다.
+5. `ai/.env`에 `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`를 설정하고
+   `LANGFUSE_TRACING_ENABLED=true`로 켠다. 기본 주소는 `http://localhost:3000`이다.
+   컨테이너에서 AI를 실행한다면 `localhost`가 아닌 그 컨테이너에서 접근 가능한 주소를 지정한다.
+
+API 키는 서버 설치용 비밀번호와 다르다. 추적은 기본적으로 꺼져 있고, 주소가 비어 있다고 클라우드로 전환하지 않는다.
+이전 추적 설정의 호환층은 제거했다. 기존 `ai/.env`에 `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`,
+`LANGSMITH_PROJECT`가 남아 있으면 삭제해야 한다. 지원하지 않는 dotenv 항목은 시작 시 설정 오류로 알린다.
+LangChain의 간접 의존성인 `langsmith` 패키지는 남지만, 추적 기록의 전송 대상은 Langfuse다.
+
+종료할 때는 `docker compose --env-file .env.langfuse -f compose.langfuse.yaml down`을 쓴다.
+`down -v`는 추적 기록을 포함한 로컬 저장 볼륨까지 지우므로 초기화할 때만 쓴다.
+
+### 기록 범위와 평가
+
+- 지시문, 지원 문서 본문, 모델 답변과 도구 결과가 저장된다. **가상 자료로 개발/평가할 때만 켠다.**
+  자체 호스팅도 개인정보 처리의 면제나 외부 모델 API 전송 방지를 뜻하지 않는다.
+- 모델이 usage를 제공하면 토큰을 기록한다. usage가 없는 호출의 사용량은 측정 불가이며 0으로 해석하지 않는다.
+- 비용은 Langfuse의 모델 가격표와 매칭되는 모델에 한해 추정한다. 로컬/사용자 정의 모델과 배치 할인은
+  프로젝트의 모델 가격 설정을 확인해야 한다. 토큰 확인만으로 실제 청구액까지 검증된 것은 아니다.
+- 일반 테스트는 추적 설정이 켜져 있어도 외부로 보내지 않는다. 추적 테스트는 실제 SDK와 메모리 exporter를 사용한다.
+  실제 모델 평가(`LLM_EVAL=true`)만 명시적으로 설정한 Langfuse 서버에 기록할 수 있다.
+- 이번 연결은 관측용이다. 골든셋 업로드, 규칙 기반 채점, LLM-as-Judge와 로그 샘플링은 별도 작업이다.
+- 의존성 `langfuse`는 전송 및 LangChain 연동에, `opentelemetry-sdk`는 다른 추적기와 격리된 provider와
+  메모리 기반 검증에 사용한다. LangSmith 과거 기록의 자동 이관은 하지 않는다.

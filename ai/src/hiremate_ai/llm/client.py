@@ -191,7 +191,7 @@ def _provider_limit(providers: str) -> dict[str, Any] | None:
 
 
 async def _traced_llm(request: Request, llm: Annotated[LlmClient, Depends(get_llm)]) -> AsyncIterator[LlmClient]:
-    """요청 하나를 LangSmith 기록 하나로 묶는다 (추적을 켰을 때만). SSE 응답은 스트림이 끝날 때 기록이 닫힌다."""
+    """요청 하나를 Langfuse 기록 하나로 묶는다 (추적을 켰을 때만). SSE 응답은 스트림이 끝날 때 기록이 닫힌다."""
     with traced(request.url.path):
         yield llm
 

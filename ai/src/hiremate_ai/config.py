@@ -69,12 +69,14 @@ class Settings(BaseSettings):
     poster_local_image_timeout: float = Field(default=300, gt=0, le=600)
     # 단일 GPU에서 Gemma 설계가 끝나면 가중치를 내리고 이미지 모델을 적재한다.
     poster_local_release_ollama: bool = False
-    # 참이면 모델을 부르는 요청 · 작업을 LangSmith에 기록한다. 지시와 자료(지원 문서 본문 포함)가 외부 서버로 나가므로
-    # 가상 지원자로 개발 · 평가할 때만 켠다. 단위 테스트는 켜 두어도 보내지 않는다 (tests/conftest.py)
-    langsmith_tracing: bool = False
-    langsmith_api_key: SecretStr = SecretStr("")
-    # 기록을 모아 볼 LangSmith 프로젝트. 없으면 첫 기록 때 만들어진다
-    langsmith_project: str = "hiremate"
+    # Langfuse 추적은 명시적으로 켠 요청 · 작업만 기록한다. 기본 주소는 로컬 자체 호스팅이다.
+    # 지원 문서 본문이 기록되므로 가상 지원자로 개발 · 평가할 때만 켠다. 단위 테스트는 외부로 보내지 않는다.
+    langfuse_tracing_enabled: bool = False
+    langfuse_base_url: str = "http://localhost:3000"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: SecretStr = SecretStr("")
+    langfuse_environment: str = "development"
+
     # Root Agent 대화방에 남기는 최근 턴 수
     root_memory_turns: int = 20
     # Application Agent: 지원 접수 분석 한 번의 시간 한도(정책 1000초). AI 워커가 대기열에서 꺼내 돌리므로

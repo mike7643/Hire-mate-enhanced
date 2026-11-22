@@ -1,4 +1,4 @@
-"""LangSmith Studio에 올리는 Root 그래프. ai 폴더에서 `uv run langgraph dev`로 연다 (ai/langgraph.json).
+"""로컬 그래프 디버거용 Root 그래프. ai 폴더에서 `uv run langgraph dev`로 연다 (ai/langgraph.json).
 
 ai 서버는 이 모듈을 쓰지 않는다. 모델은 ai/.env 설정을 쓰고, 지원자 자료는 DB 없이 ChatContext 문서로 읽는다.
 실행 context의 기본값이 가상 지원자 샘플(contract/ChatContext.json)이라 Studio에서는 message만 바꿔 넣으면 된다.

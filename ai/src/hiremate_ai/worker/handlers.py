@@ -161,7 +161,7 @@ def job_handlers(
 
 
 def _traced(job_type: str, handler: Handler) -> Handler:
-    """작업 하나의 시도 한 번을 LangSmith 기록 하나로 묶는다 (추적을 켰을 때만)."""
+    """작업 하나의 시도 한 번을 Langfuse 기록 하나로 묶는다 (추적을 켰을 때만)."""
 
     async def run(payload: dict[str, Any]) -> dict[str, Any]:
         with traced(job_type):
