@@ -1,5 +1,6 @@
 package com.hiremate.file;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
@@ -27,6 +28,7 @@ import org.apache.pdfbox.text.TextPosition;
 
 /** 제출 PDF를 페이지별로 읽는다. 원문을 요약하거나 길이로 자르지 않는다. */
 public final class PdfText {
+    private static final String GRAPHICS_REVIEW = "GRAPHICS_OR_IMAGES_REQUIRE_VISUAL_REVIEW";
 
     private PdfText() {
     }
@@ -72,24 +74,47 @@ public final class PdfText {
                 issues.add("SUSPECT_TEXT_ENCODING");
             }
             PDPage page = document.getPage(number - 1);
-            int images = 0;
-            int forms = 0;
-            if (page.getResources() != null && page.getResources().getXObjectNames().iterator().hasNext()) {
-                issues.add("GRAPHICS_OR_IMAGES_REQUIRE_VISUAL_REVIEW");
-                for (COSName name : page.getResources().getXObjectNames()) {
-                    PDXObject object = page.getResources().getXObject(name);
-                    if (object instanceof PDImageXObject) {
-                        images++;
-                    } else if (object instanceof PDFormXObject) {
-                        forms++;
-                    }
-                }
+            var counts = countGraphicsResources(page);
+            if (counts.reviewRequired()) {
+                issues.add(GRAPHICS_REVIEW);
             }
-            var gridLines = layout && !stripper.spans.isEmpty() ? PdfGridLines.read(page) : List.<GridLine>of();
-            return new Page(number, text, issues, stripper.spans, images, forms, gridLines);
+            var graphics = layout ? PdfGridLines.read(page, !stripper.spans.isEmpty()) : PdfGridLines.EMPTY;
+            return new Page(number, text, issues, stripper.spans, counts.images(), counts.forms(),
+                    graphics.gridLines(), graphics.layout());
         } catch (IOException | RuntimeException exception) {
             return new Page(number, "", List.of("PAGE_EXTRACTION_FAILED"));
         }
+    }
+
+    private static ResourceCounts countGraphicsResources(PDPage page) {
+        int images = 0;
+        int forms = 0;
+        boolean reviewRequired = false;
+        try {
+            var resources = page.getResources();
+            if (resources != null) {
+                for (COSName name : resources.getXObjectNames()) {
+                    reviewRequired = true;
+                    try {
+                        PDXObject object = resources.getXObject(name);
+                        if (object instanceof PDImageXObject) {
+                            images++;
+                        } else if (object instanceof PDFormXObject) {
+                            forms++;
+                        }
+                    } catch (IOException | RuntimeException exception) {
+                        // 깨진 그래픽 자원만 건너뛰고 읽을 수 있는 자원 수와 본문은 보존한다.
+                        continue;
+                    }
+                }
+            }
+        } catch (RuntimeException exception) {
+            reviewRequired = true;
+        }
+        return new ResourceCounts(images, forms, reviewRequired);
+    }
+
+    private record ResourceCounts(int images, int forms, boolean reviewRequired) {
     }
 
     private static final class PositionedTextStripper extends PDFTextStripper {
@@ -147,14 +172,6 @@ public final class PdfText {
             return rgbColors.get(color);
         }
 
-        private static String toHex(PDColor color) {
-            try {
-                return String.format("#%06x", color.toRGB() & 0xFFFFFF);
-            } catch (IOException | RuntimeException exception) {
-                return null;
-            }
-        }
-
         /** 조각 안에서 글자 수가 가장 많은 값. 크기나 색이 섞인 조각은 대부분의 글자 모양을 따른다. */
         private static <T> T mostCommon(List<TextPosition> positions, Function<TextPosition, T> value) {
             Map<T, Integer> counts = new LinkedHashMap<>();
@@ -168,6 +185,14 @@ public final class PdfText {
         }
     }
 
+    static String toHex(PDColor color) {
+        try {
+            return String.format("#%06x", color.toRGB() & 0xFFFFFF);
+        } catch (IOException | RuntimeException exception) {
+            return null;
+        }
+    }
+
     /**
      * 글자 조각과 위치, 모양. size는 pt, color는 채우기 색(#rrggbb)이고 읽지 못하면 null이다.
      * 모양은 제목과 본문을 가르는 단서일 뿐이고, 흰 글자처럼 보이지 않는 글도 그대로 넘긴다.
@@ -178,12 +203,37 @@ public final class PdfText {
     public record GridLine(float x1, float y1, float x2, float y2) {
     }
 
+    public record FillRect(float x1, float y1, float x2, float y2, String color) {
+    }
+
+    public record ImageBox(float x1, float y1, float x2, float y2) {
+    }
+
+    /**
+     * 본문과 같은 위쪽 원점의 페이지 좌표. 이미지는 픽셀 없이 배치 범위만 남긴다. markBoxes는 글자가 아닌 작은 그림(원, 삼각형
+     * 같은 목록 머리표)의 범위다. 사각형은 fillRects에 이미 있으므로 넣지 않는다.
+     */
+    public record Layout(float width, float height, List<FillRect> fillRects, List<ImageBox> imageBoxes,
+                         List<ImageBox> markBoxes) {
+        public Layout {
+            fillRects = List.copyOf(fillRects);
+            imageBoxes = List.copyOf(imageBoxes);
+            markBoxes = List.copyOf(markBoxes);
+        }
+    }
+
     public record Page(int number, String text, List<String> issues, List<TextSpan> spans,
-                       int imageCount, int formCount, List<GridLine> gridLines) {
+                       int imageCount, int formCount, List<GridLine> gridLines,
+                       @JsonInclude(JsonInclude.Include.NON_NULL) Layout layout) {
         public Page {
             issues = List.copyOf(issues);
             spans = spans == null ? List.of() : List.copyOf(spans);
             gridLines = gridLines == null ? List.of() : List.copyOf(gridLines);
+        }
+
+        public Page(int number, String text, List<String> issues, List<TextSpan> spans,
+                    int imageCount, int formCount, List<GridLine> gridLines) {
+            this(number, text, issues, spans, imageCount, formCount, gridLines, null);
         }
 
         public Page(int number, String text, List<String> issues) {

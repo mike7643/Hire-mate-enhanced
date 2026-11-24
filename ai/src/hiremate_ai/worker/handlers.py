@@ -12,6 +12,7 @@ from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hiremate_ai.agents.analysis.application import analyze_application, index_document, normalize_document
+from hiremate_ai.agents.analysis.application.normalize import NormalizationIntegrityError
 from hiremate_ai.agents.analysis.application.present import to_analysis
 from hiremate_ai.agents.analysis.application.service import RubricScopeError
 from hiremate_ai.agents.analysis.application.store import ReviewStore
@@ -27,7 +28,7 @@ from hiremate_ai.contract import DocumentIndexRequest, DocumentNormalizationRequ
 from hiremate_ai.db.graph import graph_driver
 from hiremate_ai.db.profile_store import ProfileScopeError
 from hiremate_ai.llm.batch_state import current_batch_job
-from hiremate_ai.llm.client import LlmClient
+from hiremate_ai.llm.client import LlmClient, StructuredLlmClient
 from hiremate_ai.llm.tracing import traced
 from hiremate_ai.tools.embedding import Embedder, get_embedder
 
@@ -44,7 +45,7 @@ def job_handlers(
     sessions: async_sessionmaker[AsyncSession],
     *,
     application_llm: LlmClient | None = None,
-    normalization_llm_factory: Callable[[], LlmClient] | None = None,
+    normalization_llm_factory: Callable[[], StructuredLlmClient] | None = None,
     document_embedder: Embedder | None = None,
     graph: AsyncDriver | None = None,
 ) -> Mapping[str, Handler]:
@@ -137,7 +138,11 @@ def job_handlers(
     async def application_normalize(payload: dict[str, Any]) -> dict[str, Any]:
         request = DocumentNormalizationRequest.model_validate(payload)
         normalizer = normalization_llm_factory() if normalization_llm_factory is not None else llm
-        result = await normalize_document(normalizer, request)
+        try:
+            result = await normalize_document(normalizer, request)
+        except NormalizationIntegrityError as error:
+            # 같은 입력이면 같은 결과다. 모델을 다시 부르지 않고 실패로 두어 PDF 추출 글을 쓰게 한다.
+            raise PermanentError(str(error)) from error
         return result.model_dump(mode="json", by_alias=True)
 
     async def application_index_document(payload: dict[str, Any]) -> dict[str, Any]:

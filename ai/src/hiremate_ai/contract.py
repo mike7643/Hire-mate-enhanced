@@ -498,6 +498,34 @@ class PdfGridLine(ContractModel):
     y2: float = Field(allow_inf_nan=False)
 
 
+class PdfBox(ContractModel):
+    """페이지 위에서 측정한 사각형. 원본 이미지나 픽셀은 전달하지 않는다."""
+
+    x1: float = Field(allow_inf_nan=False)
+    y1: float = Field(allow_inf_nan=False)
+    x2: float = Field(allow_inf_nan=False)
+    y2: float = Field(allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_extent(self) -> "PdfBox":
+        if self.x1 >= self.x2 or self.y1 >= self.y2:
+            raise ValueError("Empty PDF layout box")
+        return self
+
+
+class PdfFillRect(PdfBox):
+    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+
+
+class PdfLayout(ContractModel):
+    width: float = Field(gt=0, allow_inf_nan=False)
+    height: float = Field(gt=0, allow_inf_nan=False)
+    fill_rects: list[PdfFillRect] = Field(default_factory=list, max_length=8192)
+    image_boxes: list[PdfBox] = Field(default_factory=list, max_length=256)
+    # 글자가 아닌 작은 그림(원, 삼각형 같은 목록 머리표)의 범위. 사각형 머리표는 fill_rects에 있다.
+    mark_boxes: list[PdfBox] = Field(default_factory=list, max_length=2048)
+
+
 class PdfPage(ContractModel):
     number: int = Field(ge=1)
     text: str
@@ -506,6 +534,7 @@ class PdfPage(ContractModel):
     image_count: int = Field(default=0, ge=0)
     form_count: int = Field(default=0, ge=0)
     grid_lines: list[PdfGridLine] = Field(default_factory=list, max_length=512)
+    layout: PdfLayout | None = None
 
 
 NormalizedDocumentType = Literal[DocumentType.RESUME, DocumentType.COVER_LETTER, DocumentType.PORTFOLIO]

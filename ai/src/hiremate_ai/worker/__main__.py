@@ -53,9 +53,11 @@ async def main() -> None:
             cleanup: asyncio.Task[None] | None = None
             application_stream = f"{options.job_stream}:application-batch"
             store = RedisBatchStore(redis, f"{settings.worker_job_stream}:batch")
-            # 기능을 꺼도 이미 옮긴 작업과 제공자 배치는 같은 식별자로 마저 처리한다.
+            # 외부 프로필은 이미 옮긴 배치를 마저 처리한다. local은 기존 배치도 외부로 보내지 않는다.
             pending_batches = await redis.xlen(application_stream) > 0 or bool(await store.batches())
-            if settings.application_batch_enabled or pending_batches:
+            if settings.llm_profile == "local" and pending_batches:
+                log.warning("local 프로필에서는 대기 중인 외부 지원서 분석 배치를 처리하지 않는다")
+            if settings.llm_profile != "local" and (settings.application_batch_enabled or pending_batches):
                 client = await stack.enter_async_context(
                     httpx.AsyncClient(
                         base_url="https://openrouter.ai/api/v1/",

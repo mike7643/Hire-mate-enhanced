@@ -309,3 +309,27 @@ async def test_normalization_job_returns_policy_json_without_indexing() -> None:
     assert "application/index-document" in handlers
     assert len(normalizer.calls) == 1
     assert not general.calls
+
+
+async def test_normalization_that_changes_the_source_text_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hiremate_ai.agents.analysis.application.normalize import NormalizationIntegrityError
+
+    async def broken(llm: Any, request: Any) -> Any:
+        raise NormalizationIntegrityError(missing_chars=1, added_chars=0, segments=[3])
+
+    monkeypatch.setattr(worker_handlers, "normalize_document", broken)
+    handlers = job_handlers(FakeLlm(), MemoryStore(), SESSIONS, normalization_llm_factory=FakeLlm)
+    with pytest.raises(PermanentError, match="missing=1"):
+        await handlers["application/normalize"](
+            {
+                "companyId": str(uuid4()),
+                "recruitmentId": str(uuid4()),
+                "applicationId": str(uuid4()),
+                "documentId": str(uuid4()),
+                "revision": 1,
+                "documentType": "RESUME",
+                "pages": [
+                    {"number": 1, "text": "추출 내용", "issues": [], "spans": [], "imageCount": 0, "formCount": 0}
+                ],
+            }
+        )

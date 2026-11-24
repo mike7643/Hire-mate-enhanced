@@ -10,23 +10,40 @@ import logging
 import re
 import unicodedata
 from bisect import bisect_right
+from collections import Counter
+from collections.abc import Iterator
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from hiremate_ai.agents.analysis.application.grid import closed_grids
+from hiremate_ai.agents.analysis.application.layout_grid import detect_tables
+from hiremate_ai.agents.analysis.application.layout_structure import (
+    bulleted_lines,
+    ensure_visual_notices,
+    revise_structure,
+    visual_notice_message,
+)
 from hiremate_ai.agents.analysis.application.normalization_prompt import system_prompt
 from hiremate_ai.config import settings
 from hiremate_ai.contract import (
+    DocumentArtifact,
     DocumentBlock,
+    DocumentList,
+    DocumentListItem,
     DocumentMetadata,
     DocumentNormalizationRequest,
+    DocumentParagraph,
+    DocumentSection,
+    DocumentTable,
     NormalizedDocument,
     PdfPage,
 )
-from hiremate_ai.llm.chat import model_call_budget
-from hiremate_ai.llm.client import LlmClient
+from hiremate_ai.llm.chat import LlmFailureReason, LlmOutputError, model_call_budget
+from hiremate_ai.llm.client import StructuredLlmClient
 from hiremate_ai.llm.prompt import data_block
 
 logger = logging.getLogger(__name__)
@@ -35,9 +52,10 @@ _SPACE = re.compile(r"\s+")
 _TRAILING = re.compile(r"[ \t]+$", re.MULTILINE)
 # 같은 줄로 보는 세로 좌표 차이와, 한 글자씩 벌려 쓴 제목을 한 조각으로 합치는 가로 간격.
 _SAME_LINE = 1.0
+# 제목 후보 아래 같은 단으로 보는 들여쓰기 한도(pt). 머리표 들여쓰기는 보통 10~20pt다.
+_HEADING_INDENT = 24.0
 _LETTER_GAP = 12.0
 _MARGIN_GAP = 12.0
-_MARGIN_ALIGNMENT = 6.0
 # 모델이 이보다 많은 조각을 빠뜨리면 구조를 믿을 수 없어 실패로 둔다. 실패한 서류는 PDF 추출 글로 읽는다.
 _MAX_MISSING_RATIO = 0.5
 # 조각 번호는 ASCII이며, 로컬 JSON 문법 생성기에서 \d 대신 명시적 범위를 쓴다.
@@ -45,6 +63,39 @@ _REF = r"^[0-9]+(-[0-9]+)?$"
 _BRACKET_HEADING = re.compile(r"\[([^\[\]\n]{1,80})\]")
 # 쪽 번호로 받는 모양: 1, - 1 -, 1/3, p.2, 3쪽
 _PAGE_NUMBER = re.compile(r"(?i)[\W_]*(?:page|p\.?)?\s*\d{1,3}\s*(?:쪽|페이지)?(?:[\W_]+\d{1,3})?[\W_]*")
+# 장식으로 숨겨도 되는 기호는 둘뿐이다. 같은 선 문자가 세 개 이상 이어진 구분선과, 바로 오른쪽에 글이 붙은 목록 머리표
+# 한 글자. 물결표, 빗금, 백분율, 평점 표시처럼 뜻이 있을 수 있는 기호는 숨기지 않는다.
+_LINE_CHARS = frozenset("-=_*―—–")
+_BULLETS = frozenset("•◦▪▫■□●○◆◇▶►▷‣⁃∙◼◻-*")
+_BULLET_GAP = 15.0
+# 사이드바로 보는 채움 영역: 쪽 높이의 90% 이상, 쪽 너비의 45% 이하, 가장자리에서 1pt 안, 안팎에 각각 3줄 이상.
+_PANEL_HEIGHT = 0.9
+_PANEL_WIDTH = 0.45
+_PANEL_EDGE = 1.0
+_PANEL_LINES = 3
+
+
+def _is_separator(text: str) -> bool:
+    """같은 선 문자 세 개 이상, 또는 상자 그리기 문자만으로 된 구분선."""
+    if len(text) < 3:
+        return False
+    return all("\u2500" <= char <= "\u257f" for char in text) or (len(set(text)) == 1 and text[0] in _LINE_CHARS)
+
+
+class NormalizationIntegrityError(ValueError):
+    """정제 결과의 글자가 원문 조각과 다르다. 다시 해도 같으므로 정제 실패로 두고 PDF 추출 글을 쓴다.
+
+    지원자 글은 담지 않는다. 글자 수와, 결과에서 찾을 수 없는 조각 번호만 남긴다.
+    """
+
+    def __init__(self, *, missing_chars: int, added_chars: int, segments: list[int]) -> None:
+        self.missing_chars = missing_chars
+        self.added_chars = added_chars
+        self.segments = segments
+        shown = ",".join(str(number) for number in segments[:50])
+        super().__init__(
+            f"정제 결과가 원문 글자와 다르다 missing={missing_chars} added={added_chars} segments=[{shown}]"
+        )
 
 
 @dataclass(frozen=True)
@@ -143,6 +194,32 @@ class DocumentPlan(PlanModel):
     blocks: list[BlockPlan]
 
 
+def _plan_refs(node: DocumentPlan | BlockPlan | ItemPlan) -> Iterator[str]:
+    if isinstance(node, (DocumentPlan, SectionPlan, TablePlan)):
+        yield from node.title or []
+    if isinstance(node, (DocumentPlan, SectionPlan)):
+        for child in node.blocks:
+            yield from _plan_refs(child)
+    if isinstance(node, (ParagraphPlan, ArtifactPlan, ItemPlan)):
+        yield from node.segments
+    if isinstance(node, (ListPlan, ItemPlan)):
+        for item in node.items:
+            yield from _plan_refs(item)
+    if isinstance(node, TablePlan):
+        for row in (node.headers, *node.rows):
+            for cell in row:
+                yield from cell
+
+
+def _ref_ids(ref: str, count: int) -> range:
+    start, _, end = ref.partition("-")
+    try:
+        first, last = int(start), int(end or start)
+    except ValueError:
+        return range(0)
+    return range(first, last + 1) if 1 <= first <= last <= count else range(0)
+
+
 def build_segments(pages: list[PdfPage]) -> list[Segment]:
     """페이지 순서, 파서 순서대로 조각에 1부터 번호를 붙인다.
 
@@ -177,13 +254,47 @@ def build_segments(pages: list[PdfPage]) -> list[Segment]:
             for row, line in enumerate(unicodedata.normalize("NFC", page.text).splitlines()):
                 if line.strip():
                     pieces.append((0.0, float(row), 0.0, line, None, None))
+        if page.spans:
+            pieces = _column_order(page, pieces)
         for x, y, end_x, text, size, color in pieces:
             result.append(Segment(len(result) + 1, page.number, x, y, end_x, text, size, color))
     return result
 
 
-def _heading_candidates(by_page: dict[int, list[Segment]]) -> list[list[int]]:
-    """같은 단에서 다음 줄과 글자 모양이 대비되는 줄을 찾는다. 조각 번호는 바꾸지 않는다."""
+_Piece = tuple[float, float, float, str, float | None, str | None]
+
+
+def _column_order(page: PdfPage, pieces: list[_Piece]) -> list[_Piece]:
+    """쪽 높이를 거의 다 덮고 한쪽 가장자리에 붙은 채움 영역(사이드바)이 있으면, 그 안의 줄을 따로 한 단으로 읽는다.
+
+    단은 왼쪽부터 읽는다. 세로 위치 순서로 두 단의 줄이 번갈아 나오면 모델이 다른 단의 줄을 한 블록에 섞기 때문이다.
+    영역이 하나가 아니거나 안팎 줄이 모자라면 파서 순서를 그대로 둔다.
+    """
+    layout = page.layout
+    if layout is None:
+        return pieces
+    panels = [
+        rect
+        for rect in layout.fill_rects
+        if rect.y2 - rect.y1 >= _PANEL_HEIGHT * layout.height
+        and rect.x2 - rect.x1 <= _PANEL_WIDTH * layout.width
+        and (rect.x1 <= _PANEL_EDGE or rect.x2 >= layout.width - _PANEL_EDGE)
+    ]
+    if len(panels) != 1:
+        return pieces
+    panel = panels[0]
+    inside = [p for p in pieces if panel.x1 - 0.5 <= p[0] < p[2] <= panel.x2 + 0.5]
+    outside = [p for p in pieces if not panel.x1 - 0.5 <= p[0] < p[2] <= panel.x2 + 0.5]
+    if len(inside) < _PANEL_LINES or len(outside) < _PANEL_LINES:
+        return pieces
+    return [*inside, *outside] if panel.x1 <= _PANEL_EDGE else [*outside, *inside]
+
+
+def _heading_candidates(by_page: dict[int, list[Segment]], bulleted: AbstractSet[int] = frozenset()) -> list[list[int]]:
+    """같은 단에서 다음 줄과 글자 모양이 대비되는 줄을 찾는다. 조각 번호는 바꾸지 않는다.
+
+    bulleted는 머리표 그림으로 시작하는 줄이다. 그런 줄은 머리표만큼 들여 써 있어도 같은 단의 다음 줄로 본다.
+    """
     candidates: list[list[int]] = []
     for segments in by_page.values():
         lines = sorted(segments, key=lambda segment: (segment.y, segment.x))
@@ -208,9 +319,12 @@ def _heading_candidates(by_page: dict[int, list[Segment]]) -> list[list[int]]:
                 gap = following.y - last_y
                 if gap > 4 * head.size:
                     break
-                if gap < _SAME_LINE or abs(following.x - head.x) > 8 or following.size is None:
+                offset = following.x - head.x
+                aligned = abs(offset) <= 8
+                indented_item = following.id in bulleted and 0 < offset <= _HEADING_INDENT and len(group) == 1
+                if gap < _SAME_LINE or not (aligned or indented_item) or following.size is None:
                     continue
-                if gap <= 1.7 * head.size and head.size == following.size and head.color == following.color:
+                if aligned and gap <= 1.7 * head.size and (head.size, head.color) == (following.size, following.color):
                     group.append(following.id)
                     last_y = following.y
                     if len(group) > 2:
@@ -258,7 +372,7 @@ def join_segments(segments: list[Segment], *, keep_lines: bool = False) -> str:
     return _SPACE.sub(" ", text).strip()
 
 
-async def normalize_document(llm: LlmClient, request: DocumentNormalizationRequest) -> NormalizedDocument:
+async def normalize_document(llm: StructuredLlmClient, request: DocumentNormalizationRequest) -> NormalizedDocument:
     document, report = await normalize_with_report(llm, request)
     if report.heading_candidates_in_body:
         logger.info(
@@ -281,7 +395,7 @@ async def normalize_document(llm: LlmClient, request: DocumentNormalizationReque
 
 
 async def normalize_with_report(
-    llm: LlmClient, request: DocumentNormalizationRequest
+    llm: StructuredLlmClient, request: DocumentNormalizationRequest
 ) -> tuple[NormalizedDocument, NormalizationReport]:
     if not request.pages or [page.number for page in request.pages] != list(range(1, len(request.pages) + 1)):
         raise ValueError("정제할 페이지 정보가 없거나 순서가 올바르지 않다")
@@ -296,43 +410,218 @@ async def normalize_with_report(
     by_page: dict[int, list[Segment]] = {}
     for segment in segments:
         by_page.setdefault(segment.page, []).append(segment)
-    heading_candidates = _heading_candidates(by_page)
-    payload = json.dumps(
-        {
-            "document_type": request.document_type.value.lower(),
-            "page_count": page_count,
-            "segment_count": len(segments),
-            "heading_candidates": heading_candidates,
-            "pages": [
-                {
-                    "page": page.number,
-                    "parser_issues": page.issues,
-                    "image_objects": page.image_count,
-                    "form_objects": page.form_count,
-                    "segments": [
-                        {
-                            "id": segment.id,
-                            "x": round(segment.x, 1),
-                            "y": round(segment.y, 1),
-                            "endX": round(segment.end_x, 1),
-                            "text": segment.text.strip(),
-                        }
-                        for segment in by_page.get(page.number, [])
-                    ],
-                }
-                for page in request.pages
-            ],
-        },
-        ensure_ascii=False,
-    )
+    heading_candidates = _heading_candidates(by_page, bulleted_lines(request.pages, by_page))
+    payload = {
+        "document_type": request.document_type.value.lower(),
+        "page_count": page_count,
+        "segment_count": len(segments),
+        "heading_candidates": heading_candidates,
+        "pages": [
+            {
+                "page": page.number,
+                "parser_issues": page.issues,
+                "image_objects": page.image_count,
+                "form_objects": page.form_count,
+                "segments": [
+                    {
+                        "id": segment.id,
+                        "x": round(segment.x, 1),
+                        "y": round(segment.y, 1),
+                        "endX": round(segment.end_x, 1),
+                        "text": segment.text.strip(),
+                    }
+                    for segment in by_page.get(page.number, [])
+                ],
+            }
+            for page in request.pages
+        ],
+    }
     with model_call_budget(settings.llm_agent_max_calls):
         plan = await llm.structured(
             DocumentPlan,
             agent="application.normalize",
             system=system_prompt(),
-            user=data_block("pdf_segments", payload),
+            user=data_block("pdf_segments", json.dumps(payload, ensure_ascii=False)),
         )
-    return assemble(plan, segments, request, page_count, heading_candidates=heading_candidates)
+        if settings.llm_profile == "local":
+            plan = await _retry_missing_pages(llm, plan, payload, by_page)
+    tables = detect_tables(request.pages, segments)
+    if tables:
+        from hiremate_ai.agents.analysis.application.plan_tables import apply_geometry_tables
+
+        plan = apply_geometry_tables(plan, segments, tables)
+    plan, released = release_false_artifacts(plan, segments, page_count)
+    plan = revise_structure(plan, segments, request, released=released)
+    document, report = assemble(plan, segments, request, page_count, heading_candidates=heading_candidates)
+    report.demoted_artifacts = sorted({*report.demoted_artifacts, *(n for group in released for n in group)})
+    document = ensure_visual_notices(document, request.pages, segments)
+    verify_source_text(document, segments)
+    return document, report
+
+
+def release_false_artifacts(
+    plan: DocumentPlan, segments: list[Segment], page_count: int
+) -> tuple[DocumentPlan, list[list[int]]]:
+    """숨김 규칙에 맞지 않는 artifact 블록을 계획에서 빼고 그 조각 묶음을 돌려준다.
+
+    모델이 제목이나 항목을 머리글·장식으로 잘못 숨겨 읽는 순서와 다른 자리(대개 문서 끝)에 두었으면, 그 자리에
+    되살리는 대신 읽는 순서 자리에 구조와 함께 다시 넣도록 revise_structure에 넘긴다. 이미 읽는 순서 자리에 있는
+    잘못된 숨김은 조립이 그 자리에서 문단으로 되살린다. 내용 블록이 쓴 조각과 규칙에 맞는 숨김은 그대로 둔다.
+    """
+    count = len(segments)
+    builder = _Builder({segment.id: segment for segment in segments}, page_count)
+    content = {n for ref in plan.title or [] for n in _ref_ids(ref, count)}
+    # 계획을 앞에서부터 읽은 순서: 내용 조각 번호 묶음, 또는 artifact 블록.
+    sequence: list[list[int] | ArtifactPlan] = [sorted(content)]
+
+    def visit(blocks: list[BlockPlan]) -> None:
+        for block in blocks:
+            if isinstance(block, ArtifactPlan):
+                sequence.append(block)
+            elif isinstance(block, SectionPlan):
+                sequence.append([n for ref in block.title or [] for n in _ref_ids(ref, count)])
+                visit(block.blocks)
+            else:
+                sequence.append([n for ref in _plan_refs(block) for n in _ref_ids(ref, count)])
+
+    visit(plan.blocks)
+    content.update(n for entry in sequence if isinstance(entry, list) for n in entry)
+    seen: set[int] = set()
+    released: list[list[int]] = []
+    removed: set[int] = set()
+    for position, artifact in enumerate(sequence):
+        if not isinstance(artifact, ArtifactPlan):
+            continue
+        fresh = [n for ref in artifact.segments for n in _ref_ids(ref, count) if n not in content and n not in seen]
+        seen.update(fresh)
+        before = max((n for entry in sequence[:position] if isinstance(entry, list) for n in entry), default=0)
+        after = min(
+            (n for entry in sequence[position + 1 :] if isinstance(entry, list) for n in entry), default=count + 1
+        )
+        in_order = all(before < n < after for n in fresh)
+        if fresh and not in_order and not builder._is_artifact(artifact.role, fresh):
+            # 쪽마다 반복되는 머리글처럼 떨어진 조각을 한 블록에 모았으면, 이어지는 번호끼리 나눠
+            # 각자 읽는 자리로 보낸다.
+            runs: list[list[int]] = []
+            for number in sorted(fresh):
+                if (
+                    runs
+                    and runs[-1][-1] == number - 1
+                    and builder._segments[number - 1].page == builder._segments[number].page
+                ):
+                    runs[-1].append(number)
+                else:
+                    runs.append([number])
+            released.extend(runs)
+            removed.add(id(artifact))
+        elif not fresh and any(
+            n in seen for ref in artifact.segments for n in _ref_ids(ref, count) if n not in content
+        ):
+            # 앞의 잘못된 숨김이 이미 내놓은 조각을 다시 숨기려는 블록이다.
+            removed.add(id(artifact))
+    if not removed:
+        return plan, []
+
+    def strip(blocks: list[BlockPlan]) -> list[BlockPlan]:
+        kept: list[BlockPlan] = []
+        for block in blocks:
+            if id(block) in removed:
+                continue
+            if isinstance(block, SectionPlan):
+                block = block.model_copy(update={"blocks": strip(block.blocks)})
+            kept.append(block)
+        return kept
+
+    return plan.model_copy(update={"blocks": strip(plan.blocks)}), sorted(released)
+
+
+def _compact(text: str) -> str:
+    return "".join(char for char in unicodedata.normalize("NFC", text) if not char.isspace())
+
+
+def _output_strings(document: NormalizedDocument) -> Iterator[str]:
+    """결과에 든 원문 글. 시각 자료 안내는 코드가 쓴 문장이라 뺀다."""
+
+    def items(entries: list[DocumentListItem]) -> Iterator[str]:
+        for item in entries:
+            yield item.text
+            yield from items(item.items)
+
+    def walk(blocks: list[DocumentBlock]) -> Iterator[str]:
+        for block in blocks:
+            if isinstance(block, DocumentSection):
+                yield block.title or ""
+                yield from walk(block.blocks)
+            elif isinstance(block, (DocumentParagraph, DocumentArtifact)):
+                yield block.text
+            elif isinstance(block, DocumentList):
+                yield from items(block.items)
+            elif isinstance(block, DocumentTable):
+                yield block.title or ""
+                yield from block.headers
+                for row in block.rows:
+                    yield from row
+
+    yield document.document.title or ""
+    yield from walk(document.blocks)
+
+
+def verify_source_text(document: NormalizedDocument, segments: list[Segment]) -> None:
+    """결과의 글자가 원문 조각의 글자와 하나도 빠짐없이, 더함 없이 같은지 확인한다. 공백과 줄바꿈 차이는 보지 않는다."""
+    source = Counter(char for segment in segments for char in _compact(segment.text))
+    texts = [_compact(text) for text in _output_strings(document)]
+    output = Counter(char for text in texts for char in text)
+    if source == output:
+        return
+    joined = "".join(texts)
+    lost = [segment.id for segment in segments if (text := _compact(segment.text)) and text not in joined]
+    raise NormalizationIntegrityError(
+        missing_chars=sum((source - output).values()), added_chars=sum((output - source).values()), segments=lost
+    )
+
+
+async def _retry_missing_pages(
+    llm: StructuredLlmClient, plan: DocumentPlan, payload: dict[str, Any], by_page: dict[int, list[Segment]]
+) -> DocumentPlan:
+    """정상 응답이 통째로 건너뛴 페이지에 한해, 원래 조각 번호로 한 번 더 묻는다."""
+    count = payload["segment_count"]
+    covered = {number for ref in _plan_refs(plan) for number in _ref_ids(ref, count)}
+    extra: list[BlockPlan] = []
+    for page in payload["pages"]:
+        number = page["page"]
+        allowed = {segment.id for segment in by_page.get(number, [])}
+        if not allowed or allowed & covered:
+            continue
+        scoped = {
+            **payload,
+            "page_count": 1,
+            "segment_count": len(allowed),
+            "heading_candidates": [group for group in payload["heading_candidates"] if allowed.issuperset(group)],
+            "pages": [page],
+        }
+        try:
+            repair = await llm.structured(
+                DocumentPlan,
+                agent=f"application.normalize.retry.page_{number}",
+                system=system_prompt(),
+                user=data_block("pdf_segments", json.dumps(scoped, ensure_ascii=False)),
+            )
+        except LlmOutputError as error:
+            if error.reason == LlmFailureReason.BUDGET:
+                break
+            logger.warning("정제 페이지 재요청 실패 page=%d reason=%s", number, error.reason)
+            continue
+        except (httpx.HTTPError, TimeoutError) as error:
+            logger.warning("정제 페이지 재요청 실패 page=%d reason=%s", number, type(error).__name__)
+            continue
+        refs = [_ref_ids(ref, count) for ref in _plan_refs(repair)]
+        if not refs or any(not ids or not allowed.issuperset(ids) for ids in refs):
+            logger.warning("정제 페이지 재요청의 조각 범위가 올바르지 않다 page=%d", number)
+            continue
+        if repair.title:
+            extra.append(ParagraphPlan(type="paragraph", segments=repair.title))
+        extra.extend(repair.blocks)
+    return plan.model_copy(update={"blocks": [*plan.blocks, *extra]}) if extra else plan
 
 
 def assemble(
@@ -398,20 +687,21 @@ class _Builder:
         self._owner: dict[int, tuple[list[Node], Node | None]] = {}
         self.report = NormalizationReport(segments=len(segments))
         by_page: dict[int, list[Segment]] = {}
-        self._margin_text: dict[tuple[str, str], list[Segment]] = {}
+        # 쪽의 첫 줄이나 마지막 줄에 떨어져 있는 조각. 쪽 번호는 여기 있을 때만 숨긴다.
+        self._margin_ids: set[int] = set()
         for segment in segments.values():
             if segment.x < segment.end_x:
                 by_page.setdefault(segment.page, []).append(segment)
+        self._by_page = by_page
         for group in by_page.values():
             lines = sorted({segment.y for segment in group})
             if len(lines) < 2:
                 continue
             for segment in group:
-                text = _SPACE.sub("", segment.text)
                 if segment.y == lines[0] and lines[1] - segment.y >= _MARGIN_GAP:
-                    self._margin_text.setdefault(("header", text), []).append(segment)
+                    self._margin_ids.add(segment.id)
                 if segment.y == lines[-1] and segment.y - lines[-2] >= _MARGIN_GAP:
-                    self._margin_text.setdefault(("footer", text), []).append(segment)
+                    self._margin_ids.add(segment.id)
 
     def take(self, refs: list[str] | None) -> list[int]:
         found: list[int] = []
@@ -454,7 +744,11 @@ class _Builder:
             }
         if isinstance(plan, VisualNoticePlan):
             pages = sorted({page for page in plan.pages if 1 <= page <= self._page_count})
-            return {"type": "visual_notice", "pages": pages, "visual_type": plan.visual_type, "message": plan.message}
+            if not pages:
+                return None
+            # 모델이 쓴 문장은 내보내지 않는다. 종류와 쪽만 받고 안내문은 코드가 쓴다.
+            message = visual_notice_message(plan.visual_type, pages)
+            return {"type": "visual_notice", "pages": pages, "visual_type": plan.visual_type, "message": message}
         if isinstance(plan, ArtifactPlan):
             ids = self.take(plan.segments)
             if self._is_artifact(plan.role, ids):
@@ -464,23 +758,30 @@ class _Builder:
         return None
 
     def _is_artifact(self, role: str, ids: list[int]) -> bool:
-        """머리글과 바닥글은 두 쪽 이상에서 같은 쪽 가장자리 위치에 있어야 한다."""
+        """글이 든 줄은 숨기지 않는다. 숨기는 것은 쪽 가장자리 줄의 쪽 번호, 구분선, 목록 머리표 기호뿐이다.
+
+        쪽마다 반복되는 머리글과 바닥글도 원문이라 보이게 둔다. 모델이 붙인 header, footer 표시는 따르지 않는다.
+        """
+        if role not in ("page_number", "decoration"):
+            return False
         for segment in self.segments(ids):
             text = _SPACE.sub("", segment.text)
-            if role == "page_number" and not _PAGE_NUMBER.fullmatch(text):
+            if role == "page_number" and (not _PAGE_NUMBER.fullmatch(text) or segment.id not in self._margin_ids):
                 return False
-            if role == "decoration" and any(char.isalnum() for char in text):
+            if role == "decoration" and not (_is_separator(text) or self._is_bullet(segment, text)):
                 return False
-            if role in ("header", "footer"):
-                matching = self._margin_text.get((role, text), [])
-                if segment not in matching or not any(
-                    other.page != segment.page
-                    and abs(other.x - segment.x) <= _MARGIN_ALIGNMENT
-                    and abs(other.y - segment.y) <= _MARGIN_ALIGNMENT
-                    for other in matching
-                ):
-                    return False
         return True
+
+    def _is_bullet(self, segment: Segment, text: str) -> bool:
+        if len(text) != 1 or text not in _BULLETS:
+            return False
+        return any(
+            other.id != segment.id
+            and abs(other.y - segment.y) <= _SAME_LINE
+            and 0 <= other.x - segment.end_x <= _BULLET_GAP
+            and any(char.isalnum() for char in other.text)
+            for other in self._by_page.get(segment.page, [])
+        )
 
     def _item(self, plan: ItemPlan) -> Node:
         return {"ids": self.take(plan.segments), "items": [self._item(child) for child in plan.items]}
@@ -500,7 +801,8 @@ class _Builder:
 
     def restore_grids(self, blocks: list[Node], pages: list[PdfPage]) -> None:
         for page in pages:
-            if not page.grid_lines:
+            # 예전 대기 작업은 그리기 좌표 단서 없이 격자선만 전달한다.
+            if page.layout is not None or not page.grid_lines:
                 continue
             segments = [s for s in self._segments.values() if s.page == page.number]
             for xs, ys in closed_grids(page.grid_lines):

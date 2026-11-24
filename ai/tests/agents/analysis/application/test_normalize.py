@@ -12,6 +12,7 @@ from hiremate_ai.agents.analysis.application.normalize import (
     join_segments,
     normalize_with_report,
 )
+from hiremate_ai.config import settings
 from hiremate_ai.contract import (
     DocumentArtifact,
     DocumentList,
@@ -53,6 +54,69 @@ def plan(data: dict[str, Any]) -> DocumentPlan:
     return DocumentPlan.model_validate({"title": None, **data})
 
 
+async def test_local_model_retries_one_wholly_missing_page_with_original_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "llm_profile", "local")
+    first = plan({"blocks": [{"type": "paragraph", "segments": ["1-2"]}, {"type": "paragraph", "segments": ["5"]}]})
+    retry = plan({"title": ["3"], "blocks": [{"type": "paragraph", "segments": ["4"]}]})
+    llm = FakeLlm(first, retry)
+    pages = [
+        page(1, [span("Opening text", 20, 20), span("Next line", 20, 40)]),
+        page(2, [span("Restored heading", 20, 20), span("Restored body", 20, 40)]),
+        page(3, [span("Referenced text", 20, 20), span("Partly missed text", 20, 40)]),
+        page(4, []),
+    ]
+    document, report = await normalize_with_report(llm, request(*pages))
+    assert [call.agent for call in llm.calls] == ["application.normalize", "application.normalize.retry.page_2"]
+    original, scoped = (json.loads(c.user.split("\n", 1)[1].rsplit("\n", 1)[0]) for c in llm.calls)
+    assert scoped["page_count"] == 1 and scoped["segment_count"] == 2 and scoped["pages"] == [original["pages"][1]]
+    assert not llm.calls[1].images and llm.calls[1].system == llm.calls[0].system
+    assert document.document.title is None
+    assert [b.text for b in document.blocks if isinstance(b, DocumentParagraph) and b.pages == [2]] == [
+        "Restored heading",
+        "Restored body",
+    ]
+    assert report.missing == [6]
+
+
+@pytest.mark.parametrize("foreign_ref", ["1", "4-2", "9000"])
+async def test_local_page_retry_discards_out_of_scope_plan(monkeypatch: pytest.MonkeyPatch, foreign_ref: str) -> None:
+    monkeypatch.setattr(settings, "llm_profile", "local")
+    llm = FakeLlm(
+        plan({"blocks": [{"type": "paragraph", "segments": ["1-2"]}]}),
+        plan({"blocks": [{"type": "paragraph", "segments": ["3", foreign_ref]}]}),
+    )
+    document, report = await normalize_with_report(
+        llm,
+        request(
+            page(1, [span("Existing first line", 20, 20), span("Existing second line", 20, 40)]),
+            page(2, [span("Missed line", 20, 20)]),
+        ),
+    )
+    assert len(llm.calls) == 2
+    assert report.missing == [3] and not report.duplicated and not report.unknown
+    assert [b.text for b in document.blocks if isinstance(b, DocumentParagraph)] == [
+        "Existing first line Existing second line",
+        "Missed line",
+    ]
+
+
+@pytest.mark.parametrize("profile,budget", [("local", 1), ("cloud", 8)])
+async def test_no_page_retry_without_local_call_budget(
+    monkeypatch: pytest.MonkeyPatch, profile: str, budget: int
+) -> None:
+    monkeypatch.setattr(settings, "llm_profile", profile)
+    monkeypatch.setattr(settings, "llm_agent_max_calls", budget)
+    llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-2"]}]}))
+    _, report = await normalize_with_report(
+        llm,
+        request(
+            page(1, [span("Existing first line", 20, 20), span("Existing second line", 20, 40)]),
+            page(2, [span("Missed line", 20, 20)]),
+        ),
+    )
+    assert len(llm.calls) == 1 and report.missing == [3]
+
+
 def test_reference_schema_uses_explicit_ascii_digit_ranges_for_local_grammar() -> None:
     schema = DocumentPlan.model_json_schema(by_alias=True)
     segments = schema["$defs"]["ParagraphPlan"]["properties"]["segments"]
@@ -67,6 +131,54 @@ def test_reference_rejects_invalid_segment_ids(ref: str) -> None:
 
 def test_reference_accepts_ascii_segment_ids_and_ranges() -> None:
     assert plan({"blocks": [{"type": "paragraph", "segments": ["1", "12-14"]}]}).blocks
+
+
+@pytest.mark.parametrize("present", ["broken_table", "partial", "missing"])
+async def test_aligned_grid_is_used_when_model_split_or_misplaced_cells(present: str) -> None:
+    xs, ys = (40, 120, 200, 280), (80, 100, 120, 140)
+    fill_rects = [{"x1": 40, "y1": y - 0.25, "x2": 280, "y2": y + 0.25, "color": "#555555"} for y in ys]
+    fill_rects += [{"x1": x - 0.25, "y1": 80, "x2": x + 0.25, "y2": 140, "color": "#555555"} for x in xs]
+    fill_rects += [
+        {"x1": first, "y1": 80, "x2": last, "y2": 100, "color": "#dadee5"}
+        for first, last in zip(xs[:-1], xs[1:], strict=True)
+    ]
+    cells = [["Role", "Action", "Result"], ["Editor", "Improve", "Draft"], ["Tester", "Review", "Report"]]
+    spans = [span("Evaluation section", 45, 50), span("Before grid", 45, 65)]
+    spans += [
+        {**span(value, x + 5, y + 15, x + 70), "color": "#444488" if y == 80 else "#111111"}
+        for y, row in zip(ys[:-1], cells, strict=True)
+        for x, value in zip(xs[:-1], row, strict=True)
+    ]
+    spans += [span("After grid", 45, 150), span("Other report", 45, 165)]
+    blocks: list[dict[str, Any]] = [{"type": "paragraph", "segments": ["2"]}]
+    if present == "broken_table":
+        blocks += [
+            {"type": "table", "headers": [], "rows": [[["3", "6", "9"], ["4", "7", "10"], ["5", "8", "11"]]]},
+        ]
+    elif present == "partial":
+        blocks += [{"type": "paragraph", "segments": ["3-6", "10"]}]
+    blocks += [{"type": "paragraph", "segments": ["12"]}, {"type": "paragraph", "segments": ["13"]}]
+    llm = FakeLlm(plan({"blocks": [{"type": "section", "title": ["1"], "blocks": blocks}]}))
+    document, report = await normalize_with_report(
+        llm,
+        request(
+            page(
+                1,
+                spans,
+                layout={"width": 600, "height": 800, "fillRects": fill_rects},
+            )
+        ),
+    )
+    (section,) = document.blocks
+    assert isinstance(section, DocumentSection) and section.title == "Evaluation section"
+    before, table, after, other = section.blocks
+    assert isinstance(table, DocumentTable) and table.headers == cells[0] and table.rows == cells[1:]
+    assert [b.text for b in (before, after, other) if isinstance(b, DocumentParagraph)] == [
+        "Before grid",
+        "After grid",
+        "Other report",
+    ]
+    assert not report.missing and not report.duplicated
 
 
 @pytest.mark.parametrize(
@@ -227,6 +339,67 @@ async def test_bracketed_subheading_can_be_a_candidate_without_style_contrast() 
     assert isinstance(document.blocks[0], DocumentSection)
 
 
+def _indented_under_heading(marks: list[dict[str, float]]) -> dict[str, Any]:
+    return page(
+        1,
+        [
+            {**span("CERTIFICATES", 20, 100), "size": 9.0, "color": "#ffb3b4"},
+            {**span("화공기사 (2018.11)", 31, 121.7), "size": 8.6, "color": "#f2f2f2"},
+            {**span("위험물산업기사 (2019.05)", 31, 135.3), "size": 8.6, "color": "#f2f2f2"},
+        ],
+        layout={"width": 600, "height": 800, "markBoxes": marks},
+    )
+
+
+async def test_a_heading_over_bulleted_lines_indented_by_their_bullets_is_a_candidate() -> None:
+    # 사이드바 제목 아래 항목 글이 그려진 머리표만큼 들여 쓰여 있어도 같은 단의 내용이다.
+    llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-3"]}]}))
+    bullets = [{"x1": 20.2, "y1": y - 5.0, "x2": 23.2, "y2": y - 2.0} for y in (121.7, 135.3)]
+    _, report = await normalize_with_report(llm, request(_indented_under_heading(bullets)))
+    assert report.heading_candidates == [[1]]
+
+
+async def test_a_line_over_indented_lines_without_bullets_is_not_a_candidate() -> None:
+    # 표 머리 칸 아래 값이나 코드 앞 문장처럼, 머리표 없이 들여 쓴 줄은 다른 단으로 본다.
+    llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-3"]}]}))
+    _, report = await normalize_with_report(llm, request(_indented_under_heading([])))
+    assert report.heading_candidates == []
+
+
+async def test_a_two_line_sentence_over_bulleted_lines_is_not_a_candidate() -> None:
+    # 목록 앞 두 줄 문장은 제목이 아니다. 들여 쓴 머리표 줄과는 한 줄 제목만 비교한다.
+    llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-4"]}]}))
+    source = page(
+        1,
+        [
+            {**span("봉사 활동에서 자판이 지워진 노트북으로 공부하", 48, 100), "size": 10.0, "color": "#1b1b1b"},
+            {**span("던 학생이 떠올라 접근성을 목표로 삼았습니다.", 48, 115), "size": 10.0, "color": "#1b1b1b"},
+            {**span("키보드만으로 모든 기능 사용", 62, 133), "size": 9.2, "color": "#333333"},
+            {**span("화면 낭독기 이름표 점검", 62, 147), "size": 9.2, "color": "#333333"},
+        ],
+        layout={
+            "width": 600,
+            "height": 800,
+            "markBoxes": [{"x1": 50, "y1": y - 5.0, "x2": 53, "y2": y - 2.0} for y in (133, 147)],
+        },
+    )
+    _, report = await normalize_with_report(llm, request(source))
+    assert report.heading_candidates == []
+
+
+async def test_a_line_followed_only_by_another_column_is_not_a_candidate() -> None:
+    llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-2"]}]}))
+    source = page(
+        1,
+        [
+            {**span("CONTACT", 20, 100), "size": 9.0, "color": "#ffb3b4"},
+            {**span("본문 단의 문장입니다.", 220, 121.7), "size": 8.6, "color": "#333333"},
+        ],
+    )
+    _, report = await normalize_with_report(llm, request(source))
+    assert report.heading_candidates == []
+
+
 async def test_last_lines_of_a_long_uniform_paragraph_are_not_heading_candidates() -> None:
     llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-4"]}]}))
     source = page(
@@ -315,7 +488,8 @@ async def test_artifacts_that_hold_content_return_to_paragraphs() -> None:
     assert report.demoted_artifacts == [1, 2, 3]
 
 
-async def test_repeated_header_and_bullet_marks_stay_artifacts() -> None:
+async def test_repeated_headers_stay_visible_while_bullet_marks_and_page_numbers_stay_hidden() -> None:
+    # 글이 든 줄은 쪽마다 반복되는 머리글이어도 숨기지 않는다. 숨기는 것은 쪽 번호, 구분선, 머리표 기호뿐이다.
     first = page(1, [span("김민지 이력서", 20, 10), span("•", 20, 100, 25), span("본문 하나", 30, 100)])
     second = page(2, [span("김민지 이력서", 20, 10), span("본문 둘", 30, 100), span("- 2 -", 300, 800)])
     llm = FakeLlm(
@@ -331,8 +505,26 @@ async def test_repeated_header_and_bullet_marks_stay_artifacts() -> None:
         )
     )
     document, report = await normalize_with_report(llm, request(first, second))
-    assert [block.type for block in document.blocks] == ["artifact", "artifact", "paragraph", "artifact"]
-    assert not report.demoted_artifacts
+    hidden = [block.text for block in document.blocks if isinstance(block, DocumentArtifact)]
+    shown = [block.text for block in document.blocks if isinstance(block, DocumentParagraph)]
+    assert hidden == ["•", "- 2 -"]
+    assert shown.count("김민지 이력서") == 2
+    assert report.demoted_artifacts == [1, 4]
+
+
+@pytest.mark.parametrize("role", ["header", "footer"])
+async def test_text_repeated_at_the_same_page_edge_is_never_hidden(role: str) -> None:
+    # 포트폴리오 바닥글처럼 모든 쪽 같은 자리에 반복되는 글도 원문이라 보이게 둔다.
+    edge_y = 10 if role == "header" else 800
+    pages = [
+        page(i, [span("김주원 | SPACE, DRAWN TO SCALE", 45, edge_y), span(f"본문 {i}", 45, 300)]) for i in (1, 2, 3)
+    ]
+    edges = [str(1 + 2 * i) for i in range(3)]
+    blocks = [{"type": "artifact", "role": role, "segments": edges}]
+    blocks += [{"type": "paragraph", "segments": [str(2 + 2 * i)]} for i in range(3)]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(*pages))
+    assert not [block for block in document.blocks if isinstance(block, DocumentArtifact)]
+    assert report.demoted_artifacts == [1, 3, 5]
 
 
 @pytest.mark.parametrize("role", ["header", "footer"])
@@ -350,6 +542,64 @@ async def test_repeated_body_text_is_not_treated_as_a_margin_artifact(role: str)
     document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(*pages))
     assert document.blocks[1].type == document.blocks[4].type == "paragraph"
     assert report.demoted_artifacts == [2, 5]
+
+
+async def test_hidden_real_content_returns_in_reading_order_with_its_headings() -> None:
+    # 모델이 사이드바 제목과 항목을 머리글·장식으로 숨겨 문서 끝에 몰아 둔 경우: 원래 읽는 자리에 제목과 함께 되살린다.
+    style = {"size": 8.6, "color": "#f2f2f2"}
+    heading = {"size": 9.0, "color": "#ffb3b4"}
+    sidebar = page(
+        1,
+        [
+            {**span("CONTACT", 20, 100), **heading},
+            {**span("010-0000-0000", 20, 122), **style},
+            {**span("someone@example.com", 20, 136), **style},
+            {**span("SKILLS", 20, 166), **heading},
+            {**span("Python", 31, 188), **style},
+            {**span("SQL", 31, 202), **style},
+            {**span("본문 문장입니다.", 20, 260), "size": 9.6, "color": "#333333"},
+        ],
+        layout={
+            "width": 600,
+            "height": 800,
+            "markBoxes": [{"x1": 20.2, "y1": y - 5.0, "x2": 23.2, "y2": y - 2.0} for y in (188, 202)],
+        },
+    )
+    hidden = [("page_number", "1"), ("header", "1"), ("decoration", "2"), ("decoration", "3"), ("header", "4")]
+    hidden += [("decoration", "5"), ("decoration", "6")]
+    blocks = [{"type": "paragraph", "segments": ["7"]}]
+    blocks += [{"type": "artifact", "role": role, "segments": [ref]} for role, ref in hidden]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(sidebar))
+
+    contact, skills, body = document.blocks
+    assert isinstance(contact, DocumentSection) and isinstance(skills, DocumentSection)
+    assert contact.title == "CONTACT"
+    assert [getattr(block, "text", None) for block in contact.blocks] == ["010-0000-0000", "someone@example.com"]
+    assert skills.title == "SKILLS"
+    assert [block.type for block in skills.blocks] == ["list"]
+    assert [item.text for item in skills.blocks[0].items] == ["Python", "SQL"]  # type: ignore[union-attr]
+    assert getattr(body, "text", None) == "본문 문장입니다."
+    assert report.demoted_artifacts == [1, 2, 3, 4, 5, 6]
+    assert report.missing == []
+
+
+async def test_hidden_text_already_in_reading_order_stays_where_the_model_put_it() -> None:
+    # 마지막 문항 뒤 확인 문구를 바닥글로 숨긴 경우: 문항 안으로 옮기지 않고 그 자리(문서 맨 끝)에서 보인다.
+    letter = page(
+        1,
+        [
+            span("1. 지원 동기", 20, 100),
+            span("교육 현장의 경험을 살리고 싶습니다.", 20, 130),
+            span("위의 내용은 사실과 틀림없음을 확인합니다.", 20, 400),
+        ],
+    )
+    blocks = [
+        {"type": "section", "title": ["1"], "blocks": [{"type": "paragraph", "segments": ["2"]}]},
+        {"type": "artifact", "role": "footer", "segments": ["3"]},
+    ]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(letter))
+    assert [block.type for block in document.blocks] == ["section", "paragraph"]
+    assert report.demoted_artifacts == [3]
 
 
 async def test_personal_information_is_kept_even_when_the_model_hides_it() -> None:
@@ -381,7 +631,7 @@ async def test_fails_when_the_model_drops_most_of_the_document() -> None:
 
 
 async def test_document_with_only_artifacts_has_no_content() -> None:
-    marks = page(1, [span("•", 20, 100, 25), span("~", 20, 120, 25), span("1", 300, 800)])
+    marks = page(1, [span("────────", 20, 100), span("=====", 20, 120), span("1", 300, 800)])
     llm = FakeLlm(
         plan(
             {
@@ -394,6 +644,126 @@ async def test_document_with_only_artifacts_has_no_content() -> None:
     )
     with pytest.raises(ValueError, match="내용이 없다"):
         await normalize_with_report(llm, request(marks))
+
+
+async def test_meaningful_symbols_marked_as_decoration_stay_visible() -> None:
+    form = page(
+        1,
+        [
+            span("기간", 20, 100),
+            span("2021.03", 80, 100),
+            span("~", 170, 100, 176),
+            span("2023.02", 200, 100),
+            span("/", 290, 100, 296),
+            span("●●●○○", 20, 130),
+            span("※", 20, 160, 26),
+            span("50%", 120, 160),
+            span("자격증", 20, 190),
+            span("-", 200, 190, 205),
+        ],
+    )
+    hidden = {"3", "5", "6", "7", "10"}
+    blocks = [
+        {"type": "artifact", "role": "decoration", "segments": [str(i)]}
+        if str(i) in hidden
+        else {"type": "paragraph", "segments": [str(i)]}
+        for i in range(1, 11)
+    ]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(form))
+    assert all(block.type == "paragraph" for block in document.blocks)
+    assert report.demoted_artifacts == [3, 5, 6, 7, 10]
+
+
+async def test_separator_lines_and_list_bullets_stay_hidden() -> None:
+    lines = page(
+        1, [span("────────", 20, 100), span("•", 20, 130, 25), span("API 설계", 30, 130), span("=====", 20, 160)]
+    )
+    llm = FakeLlm(
+        plan(
+            {
+                "blocks": [
+                    {"type": "artifact", "role": "decoration", "segments": ["1"]},
+                    {"type": "artifact", "role": "decoration", "segments": ["2"]},
+                    {"type": "paragraph", "segments": ["3"]},
+                    {"type": "artifact", "role": "decoration", "segments": ["4"]},
+                ]
+            }
+        )
+    )
+    document, report = await normalize_with_report(llm, request(lines))
+    assert [block.type for block in document.blocks] == ["artifact", "artifact", "paragraph", "artifact"]
+    assert not report.demoted_artifacts
+
+
+async def test_number_inside_the_body_is_not_hidden_as_a_page_number() -> None:
+    body = page(
+        1, [span("프로젝트 수", 20, 100), span("3", 20, 120), span("팀 규모 5명", 20, 140), span("1", 300, 800)]
+    )
+    blocks = [
+        {"type": "paragraph", "segments": ["1"]},
+        {"type": "artifact", "role": "page_number", "segments": ["2"]},
+        {"type": "paragraph", "segments": ["3"]},
+        {"type": "artifact", "role": "page_number", "segments": ["4"]},
+    ]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(body))
+    assert [block.type for block in document.blocks] == ["paragraph", "paragraph", "paragraph", "artifact"]
+    assert report.demoted_artifacts == [2]
+
+
+@pytest.mark.parametrize(
+    ("kind", "pages", "message"),
+    [
+        ("image", [1], "원본 PDF 1쪽에 이미지가 있습니다. 내용은 원본에서 확인해 주세요."),
+        ("chart", [1, 2], "원본 PDF 1, 2쪽에 차트가 있습니다. 수치는 원본에서 확인해 주세요."),
+        ("diagram", [2], "원본 PDF 2쪽에 도식이 있습니다. 구성은 원본에서 확인해 주세요."),
+        ("unknown", [1], "원본 PDF 1쪽의 시각 자료를 확인해 주세요."),
+    ],
+)
+async def test_visual_notice_text_is_written_by_code_not_the_model(kind: str, pages: list[int], message: str) -> None:
+    notice = {"type": "visual_notice", "pages": pages, "visualType": kind, "message": "매출이 30% 늘어난 차트"}
+    llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-2"]}, notice]}))
+    document, _ = await normalize_with_report(
+        llm, request(page(1, [span("본문", 20, 100)]), page(2, [span("둘째", 20, 100)]))
+    )
+    notices = [block for block in document.blocks if isinstance(block, DocumentVisualNotice)]
+    assert [(n.visual_type, n.pages, n.message) for n in notices] == [(kind, pages, message)]
+
+
+async def test_visual_notice_without_a_real_page_is_dropped() -> None:
+    notice = {"type": "visual_notice", "pages": [9], "visualType": "image", "message": "원본 확인"}
+    llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1"]}, notice]}))
+    document, _ = await normalize_with_report(llm, request(page(1, [span("본문", 20, 100)])))
+    assert [block.type for block in document.blocks] == ["paragraph"]
+
+
+@pytest.mark.parametrize(
+    ("change", "missing", "added", "segments"),
+    [(lambda text: text[:-1], 1, 0, [2]), (lambda text: text + "X", 0, 1, [])],
+)
+async def test_output_that_differs_from_the_source_text_fails(
+    monkeypatch: pytest.MonkeyPatch, change: Any, missing: int, added: int, segments: list[int]
+) -> None:
+    from hiremate_ai.agents.analysis.application import normalize as module
+
+    original = module.ensure_visual_notices
+
+    def tamper(document: Any, pages: Any, found: Any) -> Any:
+        document = original(document, pages, found)
+        last = document.blocks[-1]
+        return document.model_copy(
+            update={"blocks": [*document.blocks[:-1], last.model_copy(update={"text": change(last.text)})]}
+        )
+
+    monkeypatch.setattr(module, "ensure_visual_notices", tamper)
+    llm = FakeLlm(
+        plan({"blocks": [{"type": "paragraph", "segments": ["1"]}, {"type": "paragraph", "segments": ["2"]}]})
+    )
+    with pytest.raises(module.NormalizationIntegrityError) as caught:
+        await normalize_with_report(llm, request(page(1, [span("가나다", 20, 100), span("라마바", 20, 130)])))
+    error = caught.value
+    assert isinstance(error, ValueError)
+    assert (error.missing_chars, error.added_chars, error.segments) == (missing, added, segments)
+    assert "라마바" not in str(error) and "가나다" not in str(error)
 
 
 async def test_table_cells_join_wrapped_fragments_and_drop_rows_without_values() -> None:

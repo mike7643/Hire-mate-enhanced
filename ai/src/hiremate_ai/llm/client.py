@@ -9,19 +9,16 @@ from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
-from hiremate_ai.config import settings
+from hiremate_ai.config import GEMMA_DOCUMENT_MODEL, settings
 from hiremate_ai.db.session import session_factory
 from hiremate_ai.llm.call_log import CallLog, DbCallLog
 from hiremate_ai.llm.chat import ChatLlm, ToolAgent
+from hiremate_ai.llm.ollama_normalization import OllamaNormalizationLlm
 from hiremate_ai.llm.tracing import traced
 
 
-class LlmClient(Protocol):
-    """모델 호출. 모든 Agent는 이 인터페이스로만 모델을 부른다. 호출은 ai.llm_calls에 기록된다."""
-
-    def analysis_recipe(self) -> dict[str, Any] | None:
-        """비밀정보 없는 실제 모델 설정. 알 수 없는 구현이면 None으로 재사용을 막는다."""
-        ...
+class StructuredLlmClient(Protocol):
+    """도구 사용이 필요 없는 구조화 모델 연결. 호출은 ai.llm_calls에 기록한다."""
 
     async def structured[T: BaseModel](
         self, output: type[T], *, agent: str, system: str, user: str, images: Sequence[str] = ()
@@ -31,6 +28,14 @@ class LlmClient(Protocol):
         agent는 호출한 Agent 키다 (예: "root", "candidate-analyst"). 호출 로그에 남는다.
         제출 문서나 URL 본문은 hiremate_ai.llm.prompt의 블록으로 감싸 user에 넣는다.
         """
+        ...
+
+
+class LlmClient(StructuredLlmClient, Protocol):
+    """구조화 응답과 도구 사용을 지원하는 분석 및 생성 Agent의 모델 연결."""
+
+    def analysis_recipe(self) -> dict[str, Any] | None:
+        """비밀정보 없는 실제 모델 설정. 알 수 없는 구현이면 None으로 재사용을 막는다."""
         ...
 
     def tool_agent[T: BaseModel](
@@ -78,12 +83,19 @@ def get_worker_llm() -> LlmClient:
 
 
 @cache
-def get_document_normalization_llm() -> LlmClient:
+def get_document_normalization_llm() -> StructuredLlmClient:
     return build_document_normalization_llm(DbCallLog(session_factory()))
 
 
-def build_document_normalization_llm(call_log: CallLog) -> LlmClient:
-    """실제 PDF 평가에서 사용한 OpenAI 모델과 출력 설정을 문서 정제에만 적용한다."""
+def build_document_normalization_llm(call_log: CallLog) -> StructuredLlmClient:
+    """로컬은 검증한 Ollama 요청을 쓰고, 다른 프로필에서는 기존 OpenAI 설정을 유지한다."""
+    if settings.llm_profile == "local":
+        return OllamaNormalizationLlm(
+            httpx.URL(settings.llm_base_url).copy_with(path="/api/chat"),
+            GEMMA_DOCUMENT_MODEL,
+            call_log,
+            timeout=settings.worker_llm_timeout_seconds,
+        )
     key = settings.document_normalization_api_key
     if not key.get_secret_value() and settings.llm_base_url.rstrip("/") == "https://api.openai.com/v1":
         key = settings.llm_api_key
@@ -201,10 +213,10 @@ LlmDep = Annotated[LlmClient, Depends(_traced_llm)]
 
 
 async def _traced_document_normalization_llm(
-    request: Request, llm: Annotated[LlmClient, Depends(get_document_normalization_llm)]
-) -> AsyncIterator[LlmClient]:
+    request: Request, llm: Annotated[StructuredLlmClient, Depends(get_document_normalization_llm)]
+) -> AsyncIterator[StructuredLlmClient]:
     with traced(request.url.path):
         yield llm
 
 
-DocumentNormalizationLlmDep = Annotated[LlmClient, Depends(_traced_document_normalization_llm)]
+DocumentNormalizationLlmDep = Annotated[StructuredLlmClient, Depends(_traced_document_normalization_llm)]

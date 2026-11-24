@@ -12,7 +12,7 @@ from functools import cache
 from urllib.parse import urlsplit
 
 from langchain_core.tracers.context import register_configure_hook
-from langfuse import Langfuse
+from langfuse import Langfuse, LangfuseGeneration
 from langfuse.langchain import CallbackHandler
 from langsmith import tracing_context
 from opentelemetry.sdk.trace import TracerProvider
@@ -48,6 +48,20 @@ def traced(name: str | None = None) -> Iterator[None]:
                 yield
         finally:
             _callback.reset(token)
+
+
+@contextmanager
+def native_generation(agent: str, model: str) -> Iterator[LangfuseGeneration | None]:
+    """LangChain을 거치지 않는 모델 호출은 입출력 없이 메타데이터만 기록한다."""
+    if _callback.get() is None:
+        yield None
+        return
+    # 상위 span에 연결하되 SDK가 예외 메시지와 스택을 이 span에 자동 기록하지 않게 한다.
+    span = _client().start_observation(name=agent, as_type="generation", model=model)
+    try:
+        yield span
+    finally:
+        span.end()
 
 
 @cache

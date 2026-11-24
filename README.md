@@ -210,6 +210,25 @@ HireMate/
 └── compose.production.yaml  운영 서비스 구성
 ```
 
+## 로컬 Gemma 문서 정제
+
+Ollama에 `ollama pull gemma4:26b-a4b-it-qat`로 모델을 준비한다. 로컬로 서류를 처리할 때
+`OLLAMA_NO_CLOUD=1 ollama serve`로 실행하고, AI API와 워커에 같은 `ai/.env` 설정을 사용한다.
+
+```dotenv
+LLM_PROFILE=local
+LOCAL_LLM_BASE_URL=http://127.0.0.1:11434/v1
+LOCAL_LLM_MODEL=gemma4:26b-a4b-it-qat
+APPLICATION_BATCH_ENABLED=false
+```
+
+- 정제는 `gemma4:26b-a4b-it-qat`의 Ollama `/api/chat`으로 Pydantic JSON 스키마를 그대로 보낸다. 공용 SDK가
+  필드를 필수로 바꾸지 않는다. OpenAI 키나 다른 모델로 대체하지 않는다. 이력서 분석은 같은 로컬 프로필의 Gemma 모델을 사용한다.
+- 다른 AI 기능의 로컬 모델을 바꾸더라도 Gemma 4 계열만 지정할 수 있고, 정제 모델은 검증한 태그 그대로다.
+  AI를 컨테이너 안에서 실행할 때는 접근 가능한 내부 Ollama 주소(`host.docker.internal` 또는 `ollama`)를 사용한다.
+- `local`은 대기 중인 OpenRouter 배치도 처리하지 않는다. 기존 배치를 끝낸 뒤 전환한다.
+  `openai`와 `custom`의 정제 설정은 그대로다.
+
 ## AI 추적과 토큰 사용량 (Langfuse)
 
 요청 하나와 워커 작업 하나를 trace로 묶고, LangGraph 노드와 모델/도구 호출을 하위 단계로 기록한다.

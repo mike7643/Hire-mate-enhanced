@@ -1,7 +1,29 @@
 from typing import Literal, Self
 
+import httpx
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+GEMMA_DOCUMENT_MODEL = "gemma4:26b-a4b-it-qat"
+_OLLAMA_HOSTS = {"127.0.0.1", "localhost", "::1", "host.docker.internal", "ollama"}
+
+
+def _local_ollama_v1_url(base_url: str) -> str:
+    error = "LOCAL_LLM_BASE_URL에 로컬 Ollama HTTP 주소를 설정한다 (예: http://127.0.0.1:11434/v1)"
+    try:
+        url = httpx.URL(base_url.strip())
+    except httpx.InvalidURL:
+        raise ValueError(error) from None
+    if (
+        url.scheme not in {"http", "https"}
+        or url.host not in _OLLAMA_HOSTS
+        or url.userinfo
+        or url.query
+        or url.fragment
+        or url.path.rstrip("/") not in {"", "/v1"}
+    ):
+        raise ValueError(error)
+    return str(url.copy_with(path="/v1"))
 
 
 class Settings(BaseSettings):
@@ -12,7 +34,7 @@ class Settings(BaseSettings):
     # custom은 기존 LLM_* 설정을 그대로 사용한다. local/openai는 각각 별도 설정을 선택한다.
     llm_profile: Literal["custom", "local", "openai"] = "custom"
     local_llm_base_url: str = "http://127.0.0.1:11434/v1"
-    local_llm_model: str = "gemma4:e4b"
+    local_llm_model: str = GEMMA_DOCUMENT_MODEL
     local_llm_api_key: SecretStr = SecretStr("ollama")
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-6-luna"
@@ -29,7 +51,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:8000/v1"
     llm_model: str = ""
     llm_api_key: SecretStr = SecretStr("")
-    # 문서 정제 전용 OpenAI 키. 비어 있고 공통 주소가 OpenAI면 공통 키를 사용한다.
+    # local이 아닌 프로필의 문서 정제용 OpenAI 키. 공통 주소가 OpenAI면 공통 키도 쓸 수 있다.
     document_normalization_api_key: SecretStr = SecretStr("")
     # 모델 호출 한 번을 기다리는 시간. Root Chat은 전체 시간 제한이 없어 이 값과 도구 호출 상한이 끝을 정한다.
     # 다른 Agent의 동기 호출은 backend가 60초 기다린다 (hiremate.ai.timeout)
@@ -135,7 +157,14 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _select_llm_profile(self) -> Self:
         if self.llm_profile == "local":
-            self.llm_base_url = self.local_llm_base_url
+            family, _, tag = self.local_llm_model.partition(":")
+            if family != "gemma4" or not tag or tag != tag.strip():
+                raise ValueError("local 프로필의 LOCAL_LLM_MODEL은 Gemma 4 Ollama 태그여야 한다")
+            if self.application_batch_enabled:
+                raise ValueError(
+                    "local 프로필은 외부 배치를 사용하지 않는다. APPLICATION_BATCH_ENABLED=false로 설정한다"
+                )
+            self.llm_base_url = _local_ollama_v1_url(self.local_llm_base_url)
             self.llm_model = self.local_llm_model
             self.llm_api_key = self.local_llm_api_key
         elif self.llm_profile == "openai":
