@@ -63,11 +63,16 @@ _REF = r"^[0-9]+(-[0-9]+)?$"
 _BRACKET_HEADING = re.compile(r"\[([^\[\]\n]{1,80})\]")
 # 쪽 번호로 받는 모양: 1, - 1 -, 1/3, p.2, 3쪽
 _PAGE_NUMBER = re.compile(r"(?i)[\W_]*(?:page|p\.?)?\s*\d{1,3}\s*(?:쪽|페이지)?(?:[\W_]+\d{1,3})?[\W_]*")
-# 장식으로 숨겨도 되는 기호는 둘뿐이다. 같은 선 문자가 세 개 이상 이어진 구분선과, 바로 오른쪽에 글이 붙은 목록 머리표
-# 한 글자. 물결표, 빗금, 백분율, 평점 표시처럼 뜻이 있을 수 있는 기호는 숨기지 않는다.
+# 장식으로 숨겨도 되는 기호는 둘뿐이다. 같은 선 문자가 세 개 이상 이어진 구분선과, 줄 첫머리에서 바로 오른쪽에 글이
+# 붙은 목록 머리표 한 글자. 물결표, 빗금, 백분율, 평점 표시처럼 뜻이 있을 수 있는 기호는 숨기지 않는다.
 _LINE_CHARS = frozenset("-=_*―—–")
 _BULLETS = frozenset("•◦▪▫■□●○◆◇▶►▷‣⁃∙◼◻-*")
 _BULLET_GAP = 15.0
+# 글 뒤에 놓이면 선택 표시(병역 ■ 군필 □ 미필)로 보는 기호. 이런 기호가 글 뒤에 있는 줄은 기호를 하나도 숨기지 않는다.
+_OPTION_MARKS = frozenset("■□●○◆◇◼◻▪▫")
+# 쪽 번호와 같은 줄에 글이 있으면, 그 글과 쪽 글 영역 너비의 1/3 이상 떨어져 있을 때만 쪽 번호로 본다. 바닥글
+# "이름 | 제목 ... 3"은 70% 넘게 떨어지고, 마지막 줄의 점수("TOEIC 2023.03 760")는 5% 안팎이다.
+_PAGE_NUMBER_APART = 1 / 3
 # 사이드바로 보는 채움 영역: 쪽 높이의 90% 이상, 쪽 너비의 45% 이하, 가장자리에서 1pt 안, 안팎에 각각 3줄 이상.
 _PANEL_HEIGHT = 0.9
 _PANEL_WIDTH = 0.45
@@ -110,6 +115,10 @@ class Segment:
     text: str
     size: float | None = None
     color: str | None = None
+
+
+def _has_text(segment: Segment) -> bool:
+    return any(char.isalnum() for char in segment.text)
 
 
 @dataclass
@@ -586,7 +595,7 @@ async def _retry_missing_pages(
     """정상 응답이 통째로 건너뛴 페이지에 한해, 원래 조각 번호로 한 번 더 묻는다."""
     count = payload["segment_count"]
     covered = {number for ref in _plan_refs(plan) for number in _ref_ids(ref, count)}
-    extra: list[BlockPlan] = []
+    extra: list[tuple[int, list[BlockPlan]]] = []
     for page in payload["pages"]:
         number = page["page"]
         allowed = {segment.id for segment in by_page.get(number, [])}
@@ -618,10 +627,30 @@ async def _retry_missing_pages(
         if not refs or any(not ids or not allowed.issuperset(ids) for ids in refs):
             logger.warning("정제 페이지 재요청의 조각 범위가 올바르지 않다 page=%d", number)
             continue
-        if repair.title:
-            extra.append(ParagraphPlan(type="paragraph", segments=repair.title))
-        extra.extend(repair.blocks)
-    return plan.model_copy(update={"blocks": [*plan.blocks, *extra]}) if extra else plan
+        made: list[BlockPlan] = [ParagraphPlan(type="paragraph", segments=repair.title)] if repair.title else []
+        extra.append((min(allowed), [*made, *repair.blocks]))
+    blocks = list(plan.blocks)
+    for first, made in extra:
+        blocks = _place_page(blocks, made, first, count)
+    return plan.model_copy(update={"blocks": blocks}) if extra else plan
+
+
+def _place_page(blocks: list[BlockPlan], made: list[BlockPlan], first: int, count: int) -> list[BlockPlan]:
+    """다시 물어 얻은 쪽의 블록을 읽는 자리에 넣는다. 조각 번호가 곧 읽는 순서다.
+
+    그 쪽보다 뒤 번호로 시작하는 첫 블록 앞에 넣는다. 앞 번호로 시작해 뒤 번호까지 걸친 섹션이면 그 섹션 안에서
+    같은 방법으로 넣는다.
+    """
+    for position, block in enumerate(blocks):
+        ids = [number for ref in _plan_refs(block) for number in _ref_ids(ref, count)]
+        if not ids:
+            continue
+        if min(ids) > first:
+            return [*blocks[:position], *made, *blocks[position:]]
+        if max(ids) > first and isinstance(block, SectionPlan):
+            inner = _place_page(list(block.blocks), made, first, count)
+            return [*blocks[:position], block.model_copy(update={"blocks": inner}), *blocks[position + 1 :]]
+    return [*blocks, *made]
 
 
 def assemble(
@@ -693,6 +722,9 @@ class _Builder:
             if segment.x < segment.end_x:
                 by_page.setdefault(segment.page, []).append(segment)
         self._by_page = by_page
+        self._text_width = {
+            page: max(s.end_x for s in group) - min(s.x for s in group) for page, group in by_page.items()
+        }
         for group in by_page.values():
             lines = sorted({segment.y for segment in group})
             if len(lines) < 2:
@@ -766,22 +798,50 @@ class _Builder:
             return False
         for segment in self.segments(ids):
             text = _SPACE.sub("", segment.text)
-            if role == "page_number" and (not _PAGE_NUMBER.fullmatch(text) or segment.id not in self._margin_ids):
+            if role == "page_number" and (
+                not _PAGE_NUMBER.fullmatch(text)
+                or segment.id not in self._margin_ids
+                or not self._apart_from_line_text(segment, ids)
+            ):
                 return False
             if role == "decoration" and not (_is_separator(text) or self._is_bullet(segment, text)):
                 return False
         return True
 
     def _is_bullet(self, segment: Segment, text: str) -> bool:
+        """줄 첫머리에 있고 바로 오른쪽에 글이 붙은 한 글자 기호만 머리표다.
+
+        글 뒤에 놓인 기호(기간 사이 붙임표, 선택 표시)는 뜻이 있으므로 숨기지 않는다. 같은 줄에 글 뒤에 놓인 선택 표시가
+        하나라도 있으면 그 줄은 선택지 줄이라 첫머리 기호도 숨기지 않는다.
+        """
         if len(text) != 1 or text not in _BULLETS:
             return False
-        return any(
-            other.id != segment.id
-            and abs(other.y - segment.y) <= _SAME_LINE
-            and 0 <= other.x - segment.end_x <= _BULLET_GAP
-            and any(char.isalnum() for char in other.text)
-            for other in self._by_page.get(segment.page, [])
+        line = self._line_of(segment)
+
+        def after_text(mark: Segment) -> bool:
+            return any(other.end_x <= mark.x and _has_text(other) for other in line if other.id != mark.id)
+
+        if after_text(segment):
+            return False
+        if any(_SPACE.sub("", other.text) in _OPTION_MARKS and after_text(other) for other in line):
+            return False
+        return any(0 <= other.x - segment.end_x <= _BULLET_GAP and _has_text(other) for other in line)
+
+    def _apart_from_line_text(self, segment: Segment, ids: list[int]) -> bool:
+        """같은 줄의 다른 글이 없거나, 모두 쪽 글 영역 너비의 1/3 이상 떨어져 있다."""
+        apart = self._text_width.get(segment.page, 0) * _PAGE_NUMBER_APART
+        return all(
+            other.id in ids or not _has_text(other) or max(other.x - segment.end_x, segment.x - other.end_x) >= apart
+            for other in self._line_of(segment)
         )
+
+    def _line_of(self, segment: Segment) -> list[Segment]:
+        """같은 쪽, 같은 줄에 있는 다른 조각."""
+        return [
+            other
+            for other in self._by_page.get(segment.page, [])
+            if other.id != segment.id and abs(other.y - segment.y) <= _SAME_LINE
+        ]
 
     def _item(self, plan: ItemPlan) -> Node:
         return {"ids": self.take(plan.segments), "items": [self._item(child) for child in plan.items]}

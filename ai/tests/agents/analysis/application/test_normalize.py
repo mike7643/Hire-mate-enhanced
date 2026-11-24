@@ -710,6 +710,99 @@ async def test_number_inside_the_body_is_not_hidden_as_a_page_number() -> None:
     assert report.demoted_artifacts == [2]
 
 
+async def test_number_close_to_text_on_the_last_line_is_not_hidden_as_a_page_number() -> None:
+    # 마지막 줄의 점수. 글 영역 너비 520pt의 1/3보다 가깝다.
+    body = page(1, [span("자격", 20, 100, 540), span("TOEIC 2023.03", 20, 800, 150), span("760", 180, 800, 198)])
+    blocks = [
+        {"type": "paragraph", "segments": ["1-2"]},
+        {"type": "artifact", "role": "page_number", "segments": ["3"]},
+    ]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(body))
+    assert not any(isinstance(block, DocumentArtifact) for block in document.blocks)
+    assert report.demoted_artifacts == [3]
+
+
+async def test_page_number_far_from_the_footer_text_on_its_line_stays_hidden() -> None:
+    body = page(1, [span("본문", 20, 100, 540), span("홍길동 | 포트폴리오", 20, 800, 160), span("3", 530, 800, 536)])
+    blocks = [
+        {"type": "paragraph", "segments": ["1-2"]},
+        {"type": "artifact", "role": "page_number", "segments": ["3"]},
+    ]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(body))
+    assert [block.type for block in document.blocks] == ["paragraph", "artifact"]
+    assert not report.demoted_artifacts
+
+
+@pytest.mark.parametrize(
+    "spans",
+    [
+        # 기간 사이의 붙임표
+        [span("2021.03", 20, 100), span("-", 94, 100, 99), span("2023.02", 103, 100)],
+        # 줄 가운데의 선택 표시
+        [
+            span("병역", 20, 100),
+            span("■", 44, 100, 52),
+            span("군필", 56, 100),
+            span("□", 80, 100, 88),
+            span("미필", 92, 100),
+        ],
+        # 줄 첫머리라도 같은 줄에 다른 선택 표시가 글 뒤에 있으면 선택지 줄이다
+        [span("□", 20, 100, 28), span("군필", 32, 100), span("■", 56, 100, 64), span("미필", 68, 100)],
+    ],
+)
+async def test_symbols_after_text_on_the_same_line_are_not_hidden_as_bullets(spans: list[dict[str, Any]]) -> None:
+    marks = [str(i) for i, item in enumerate(spans, 1) if len(item["text"]) == 1]
+    blocks = [
+        {"type": "artifact", "role": "decoration", "segments": [str(i)]}
+        if str(i) in marks
+        else {"type": "paragraph", "segments": [str(i)]}
+        for i in range(1, len(spans) + 1)
+    ]
+    document, report = await normalize_with_report(FakeLlm(plan({"blocks": blocks})), request(page(1, spans)))
+    assert not any(isinstance(block, DocumentArtifact) for block in document.blocks)
+    assert report.demoted_artifacts == [int(n) for n in marks]
+
+
+async def test_a_page_the_model_skipped_returns_to_its_reading_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "llm_profile", "local")
+    first = plan({"blocks": [{"type": "paragraph", "segments": ["1-2"]}, {"type": "paragraph", "segments": ["5-6"]}]})
+    retry = plan({"blocks": [{"type": "paragraph", "segments": ["3-4"]}]})
+    pages = [
+        page(1, [span("Page one first", 20, 20), span("Page one second", 20, 40)]),
+        page(2, [span("Page two first", 20, 20), span("Page two second", 20, 40)]),
+        page(3, [span("Page three first", 20, 20), span("Page three second", 20, 40)]),
+    ]
+    document, _ = await normalize_with_report(FakeLlm(first, retry), request(*pages))
+    assert [b.pages for b in document.blocks if isinstance(b, DocumentParagraph)] == [[1], [2], [3]]
+
+
+async def test_a_skipped_page_goes_inside_the_section_that_spans_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "llm_profile", "local")
+    first = plan(
+        {
+            "blocks": [
+                {
+                    "type": "section",
+                    "title": ["1"],
+                    "blocks": [{"type": "paragraph", "segments": ["2"]}, {"type": "paragraph", "segments": ["5-6"]}],
+                },
+                {"type": "section", "title": ["7"], "blocks": [{"type": "paragraph", "segments": ["8"]}]},
+            ]
+        }
+    )
+    retry = plan({"blocks": [{"type": "paragraph", "segments": ["3-4"]}]})
+    pages = [
+        page(1, [span("Experience", 20, 20), span("Page one body", 20, 40)]),
+        page(2, [span("Page two first", 20, 20), span("Page two second", 20, 40)]),
+        page(3, [span("Page three first", 20, 20), span("Page three second", 20, 40)]),
+        page(4, [span("Education", 20, 20), span("Page four body", 20, 40)]),
+    ]
+    document, _ = await normalize_with_report(FakeLlm(first, retry), request(*pages))
+    sections = [b for b in document.blocks if isinstance(b, DocumentSection)]
+    assert [s.title for s in sections] == ["Experience", "Education"]
+    assert [b.pages for b in sections[0].blocks if isinstance(b, DocumentParagraph)] == [[1], [2], [3]]
+
+
 @pytest.mark.parametrize(
     ("kind", "pages", "message"),
     [
