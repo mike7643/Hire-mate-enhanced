@@ -29,7 +29,8 @@ def _local_ollama_v1_url(base_url: str) -> str:
 class Settings(BaseSettings):
     """환경 변수로 읽는 설정. 기본값은 로컬 개발(저장소 루트의 compose.yaml) 기준이다."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # 빈 값은 설정하지 않은 것으로 본다(.env.example을 그대로 복사해도 기본값으로 시작한다).
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", env_ignore_empty=True)
 
     # custom은 기존 LLM_* 설정을 그대로 사용한다. local/openai는 각각 별도 설정을 선택한다.
     llm_profile: Literal["custom", "local", "openai"] = "custom"

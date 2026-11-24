@@ -93,3 +93,16 @@ def test_unknown_dotenv_settings_still_fail(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="extra_forbidden"):
         Settings(_env_file=dotenv)
+
+
+def test_the_env_example_copied_as_is_starts_with_defaults(tmp_path: Path) -> None:
+    """ai/.env.example 을 그대로 복사해도 빈 값은 기본값으로 읽혀야 한다(설명대로)."""
+    example = Path(__file__).resolve().parents[1] / ".env.example"
+    env = tmp_path / ".env"
+    env.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+    config = Settings(_env_file=env)
+    assert config.llm_profile == "local"
+    assert config.normalization_part_chars == 30000
+    assert config.normalization_max_pages == 40
+    assert config.worker_llm_timeout_seconds == 500
+    assert config.ncs_device == "cpu"
