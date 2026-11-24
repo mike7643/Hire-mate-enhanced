@@ -311,6 +311,30 @@ async def test_normalization_job_returns_policy_json_without_indexing() -> None:
     assert not general.calls
 
 
+async def test_a_document_over_the_normalization_page_limit_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hiremate_ai.config import settings
+
+    monkeypatch.setattr(settings, "normalization_max_pages", 1)
+    normalizer = FakeLlm()
+    handlers = job_handlers(FakeLlm(), MemoryStore(), SESSIONS, normalization_llm_factory=lambda: normalizer)
+    pages = [
+        {"number": n, "text": "추출 내용", "issues": [], "spans": [], "imageCount": 0, "formCount": 0} for n in (1, 2)
+    ]
+    with pytest.raises(PermanentError, match="2쪽"):
+        await handlers["application/normalize"](
+            {
+                "companyId": str(uuid4()),
+                "recruitmentId": str(uuid4()),
+                "applicationId": str(uuid4()),
+                "documentId": str(uuid4()),
+                "revision": 1,
+                "documentType": "PORTFOLIO",
+                "pages": pages,
+            }
+        )
+    assert not normalizer.calls
+
+
 async def test_normalization_that_changes_the_source_text_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
     from hiremate_ai.agents.analysis.application.normalize import NormalizationIntegrityError
 

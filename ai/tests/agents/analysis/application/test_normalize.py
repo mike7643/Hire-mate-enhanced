@@ -100,12 +100,14 @@ async def test_local_page_retry_discards_out_of_scope_plan(monkeypatch: pytest.M
     ]
 
 
-@pytest.mark.parametrize("profile,budget", [("local", 1), ("cloud", 8)])
+@pytest.mark.parametrize(
+    "profile,limit,budget", [("local", "normalization_max_calls", 1), ("cloud", "llm_agent_max_calls", 8)]
+)
 async def test_no_page_retry_without_local_call_budget(
-    monkeypatch: pytest.MonkeyPatch, profile: str, budget: int
+    monkeypatch: pytest.MonkeyPatch, profile: str, limit: str, budget: int
 ) -> None:
     monkeypatch.setattr(settings, "llm_profile", profile)
-    monkeypatch.setattr(settings, "llm_agent_max_calls", budget)
+    monkeypatch.setattr(settings, limit, budget)
     llm = FakeLlm(plan({"blocks": [{"type": "paragraph", "segments": ["1-2"]}]}))
     _, report = await normalize_with_report(
         llm,

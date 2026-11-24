@@ -12,7 +12,7 @@ from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hiremate_ai.agents.analysis.application import analyze_application, index_document, normalize_document
-from hiremate_ai.agents.analysis.application.normalize import NormalizationIntegrityError
+from hiremate_ai.agents.analysis.application.normalize import NormalizationIntegrityError, NormalizationLimitError
 from hiremate_ai.agents.analysis.application.present import to_analysis
 from hiremate_ai.agents.analysis.application.service import RubricScopeError
 from hiremate_ai.agents.analysis.application.store import ReviewStore
@@ -140,7 +140,7 @@ def job_handlers(
         normalizer = normalization_llm_factory() if normalization_llm_factory is not None else llm
         try:
             result = await normalize_document(normalizer, request)
-        except NormalizationIntegrityError as error:
+        except (NormalizationIntegrityError, NormalizationLimitError) as error:
             # 같은 입력이면 같은 결과다. 모델을 다시 부르지 않고 실패로 두어 PDF 추출 글을 쓰게 한다.
             raise PermanentError(str(error)) from error
         return result.model_dump(mode="json", by_alias=True)

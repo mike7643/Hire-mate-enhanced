@@ -87,6 +87,10 @@ def _is_separator(text: str) -> bool:
     return all("\u2500" <= char <= "\u257f" for char in text) or (len(set(text)) == 1 and text[0] in _LINE_CHARS)
 
 
+class NormalizationLimitError(ValueError):
+    """서류가 정제 한도(쪽 수)를 넘는다. 다시 해도 같으므로 정제 실패로 두고 PDF 추출 글을 쓴다."""
+
+
 class NormalizationIntegrityError(ValueError):
     """정제 결과의 글자가 원문 조각과 다르다. 다시 해도 같으므로 정제 실패로 두고 PDF 추출 글을 쓴다.
 
@@ -412,6 +416,10 @@ async def normalize_with_report(
         raise ValueError("페이지 추출에 실패했다")
     if not any(page.text.strip() for page in request.pages):
         raise ValueError("추출된 텍스트가 없다")
+    if len(request.pages) > settings.normalization_max_pages:
+        raise NormalizationLimitError(
+            f"정제 쪽 수 한도({settings.normalization_max_pages}쪽)를 넘는 {len(request.pages)}쪽 서류다"
+        )
     segments = build_segments(request.pages)
     if not segments:
         raise ValueError("추출된 텍스트가 없다")
@@ -445,15 +453,12 @@ async def normalize_with_report(
             for page in request.pages
         ],
     }
-    with model_call_budget(settings.llm_agent_max_calls):
-        plan = await llm.structured(
-            DocumentPlan,
-            agent="application.normalize",
-            system=system_prompt(),
-            user=data_block("pdf_segments", json.dumps(payload, ensure_ascii=False)),
-        )
-        if settings.llm_profile == "local":
-            plan = await _retry_missing_pages(llm, plan, payload, by_page)
+    if settings.llm_profile == "local":
+        with model_call_budget(settings.normalization_max_calls):
+            plan = await _ask_local(llm, payload, by_page)
+    else:
+        with model_call_budget(settings.llm_agent_max_calls):
+            plan = await _ask(llm, "application.normalize", payload)
     tables = detect_tables(request.pages, segments)
     if tables:
         from hiremate_ai.agents.analysis.application.plan_tables import apply_geometry_tables
@@ -589,6 +594,127 @@ def verify_source_text(document: NormalizedDocument, segments: list[Segment]) ->
     )
 
 
+async def _ask(llm: StructuredLlmClient, agent: str, payload: dict[str, Any]) -> DocumentPlan:
+    return await llm.structured(
+        DocumentPlan,
+        agent=agent,
+        system=system_prompt(),
+        user=data_block("pdf_segments", json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+async def _ask_local(
+    llm: StructuredLlmClient, payload: dict[str, Any], by_page: dict[int, list[Segment]]
+) -> DocumentPlan:
+    """로컬 모델에 묻는다. 길면 쪽 묶음으로 나눠 묻고, 답이 빠뜨리거나 실패한 쪽은 쪽마다 다시 묻는다.
+
+    한도 안의 서류는 서류 전체를 한 번에 묻는다(요청이 이전과 같다). 여러 쪽 서류에서 그 호출이 실패하면 서류를 버리지
+    않고 쪽마다 다시 묻는다. 한 쪽짜리 서류의 실패는 그대로 올려 작업을 다시 시도하게 한다.
+    """
+    parts = _page_parts(payload)
+    if len(parts) == 1:
+        try:
+            plan = await _ask(llm, "application.normalize", payload)
+        except (LlmOutputError, httpx.HTTPError, TimeoutError) as error:
+            if payload["page_count"] == 1 or (
+                isinstance(error, LlmOutputError) and error.reason == LlmFailureReason.BUDGET
+            ):
+                raise
+            logger.warning(
+                "정제 호출 실패, 쪽마다 다시 묻는다 pages=%d reason=%s", payload["page_count"], _reason(error)
+            )
+            plan = DocumentPlan(title=None, blocks=[])
+    else:
+        plans: list[DocumentPlan] = []
+        for pages in parts:
+            allowed = {segment.id for page in pages for segment in by_page.get(page["page"], [])}
+            first, last = pages[0]["page"], pages[-1]["page"]
+            try:
+                part = await _ask(llm, f"application.normalize.part_{first}_{last}", _scoped(payload, pages, allowed))
+            except (LlmOutputError, httpx.HTTPError, TimeoutError) as error:
+                if isinstance(error, LlmOutputError) and error.reason == LlmFailureReason.BUDGET:
+                    break
+                logger.warning("정제 쪽 묶음 호출 실패 pages=%d-%d reason=%s", first, last, _reason(error))
+                continue
+            if not _within(part, allowed, payload["segment_count"]):
+                logger.warning("정제 쪽 묶음 답의 조각 범위가 올바르지 않다 pages=%d-%d", first, last)
+                continue
+            plans.append(part)
+        plan = _merge_parts(plans)
+    return await _retry_missing_pages(llm, plan, payload, by_page)
+
+
+def _reason(error: Exception) -> str:
+    return str(error.reason) if isinstance(error, LlmOutputError) else type(error).__name__
+
+
+def _page_parts(payload: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    """요청 글자 수가 한도 안이면 전체 한 묶음, 넘으면 한도 안에서 연속한 쪽을 앞에서부터 묶는다."""
+    limit = settings.normalization_part_chars
+    if len(json.dumps(payload, ensure_ascii=False)) <= limit:
+        return [payload["pages"]]
+    parts: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    size = 0
+    for page in payload["pages"]:
+        length = len(json.dumps(page, ensure_ascii=False))
+        if current and size + length > limit:
+            parts.append(current)
+            current, size = [], 0
+        current.append(page)
+        size += length
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _scoped(payload: dict[str, Any], pages: list[dict[str, Any]], allowed: set[int]) -> dict[str, Any]:
+    """일부 쪽만 묻는 요청. 조각 번호는 서류 전체 번호를 그대로 쓴다."""
+    return {
+        **payload,
+        "page_count": len(pages),
+        "segment_count": len(allowed),
+        "heading_candidates": [group for group in payload["heading_candidates"] if allowed.issuperset(group)],
+        "pages": pages,
+    }
+
+
+def _within(plan: DocumentPlan, allowed: set[int], count: int) -> bool:
+    refs = [_ref_ids(ref, count) for ref in _plan_refs(plan)]
+    return bool(refs) and all(ids and allowed.issuperset(ids) for ids in refs)
+
+
+def _merge_parts(plans: list[DocumentPlan]) -> DocumentPlan:
+    """쪽 묶음 답을 읽는 순서대로 잇는다.
+
+    다음 묶음이 제목 없는 글로 시작하면 앞 묶음 마지막 섹션이 쪽을 넘어 이어진 것이므로 그 섹션 끝에 붙인다. 묶음에
+    제목이 있으면 그 제목으로 섹션을 연다. 문서 제목은 첫 묶음의 제목이다.
+    """
+    if not plans:
+        return DocumentPlan(title=None, blocks=[])
+    blocks: list[BlockPlan] = list(plans[0].blocks)
+    for part in plans[1:]:
+        if part.title:
+            blocks.append(SectionPlan(type="section", title=part.title, blocks=list(part.blocks)))
+            continue
+        rest = list(part.blocks)
+        lead: list[BlockPlan] = []
+        while rest and not (isinstance(rest[0], SectionPlan) and rest[0].title):
+            head = rest.pop(0)
+            lead.extend(head.blocks if isinstance(head, SectionPlan) else [head])
+        blocks = [*_continue_last(blocks, lead), *rest]
+    return DocumentPlan(title=plans[0].title, blocks=blocks)
+
+
+def _continue_last(blocks: list[BlockPlan], lead: list[BlockPlan]) -> list[BlockPlan]:
+    if not lead:
+        return blocks
+    if blocks and isinstance(blocks[-1], SectionPlan):
+        last = blocks[-1]
+        return [*blocks[:-1], last.model_copy(update={"blocks": _continue_last(list(last.blocks), lead)})]
+    return [*blocks, *lead]
+
+
 async def _retry_missing_pages(
     llm: StructuredLlmClient, plan: DocumentPlan, payload: dict[str, Any], by_page: dict[int, list[Segment]]
 ) -> DocumentPlan:
@@ -601,20 +727,8 @@ async def _retry_missing_pages(
         allowed = {segment.id for segment in by_page.get(number, [])}
         if not allowed or allowed & covered:
             continue
-        scoped = {
-            **payload,
-            "page_count": 1,
-            "segment_count": len(allowed),
-            "heading_candidates": [group for group in payload["heading_candidates"] if allowed.issuperset(group)],
-            "pages": [page],
-        }
         try:
-            repair = await llm.structured(
-                DocumentPlan,
-                agent=f"application.normalize.retry.page_{number}",
-                system=system_prompt(),
-                user=data_block("pdf_segments", json.dumps(scoped, ensure_ascii=False)),
-            )
+            repair = await _ask(llm, f"application.normalize.retry.page_{number}", _scoped(payload, [page], allowed))
         except LlmOutputError as error:
             if error.reason == LlmFailureReason.BUDGET:
                 break
@@ -623,8 +737,7 @@ async def _retry_missing_pages(
         except (httpx.HTTPError, TimeoutError) as error:
             logger.warning("정제 페이지 재요청 실패 page=%d reason=%s", number, type(error).__name__)
             continue
-        refs = [_ref_ids(ref, count) for ref in _plan_refs(repair)]
-        if not refs or any(not ids or not allowed.issuperset(ids) for ids in refs):
+        if not _within(repair, allowed, count):
             logger.warning("정제 페이지 재요청의 조각 범위가 올바르지 않다 page=%d", number)
             continue
         made: list[BlockPlan] = [ParagraphPlan(type="paragraph", segments=repair.title)] if repair.title else []

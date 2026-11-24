@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     # AI 워커의 모델 호출 한 번 시간 한도. 워커 작업은 화면이 기다리지 않는다. 1만 자가 넘는 자기소개서는 문장 분석
     # 답이 길어 LLM_TIMEOUT_SECONDS(50초, 화면이 기다리는 호출 기준)를 넘기도 했다. 작업의 전체 한도 안에서만 쓴다
     worker_llm_timeout_seconds: float = 500
+    # 로컬 문서 정제 요청 한 번에 넣는 조각 JSON 글자 수 한도. 넘으면 처음부터 연속한 쪽 묶음으로 나눠 묻는다.
+    # 실측(train 서류): 요청이 약 2만 토큰(시스템 지시 약 1.6천 토큰 + 글자당 약 0.61토큰)을 넘으면 Gemma가 앞 몇 쪽만
+    # 답하고 멈췄고, 1.8만 토큰 서류는 통째로 답했다. 3만 자는 약 2만 토큰이다.
+    normalization_part_chars: int = Field(default=30000, gt=0)
+    # 이보다 쪽이 많은 서류는 정제하지 않고 PDF 추출 글을 쓴다. 로컬 모델 하나가 한 서류에 수십 분을 쓰지 않게 한다.
+    normalization_max_pages: int = Field(default=40, gt=0)
+    # 서류 하나를 정제할 때 모델을 부르는 최대 횟수(쪽 묶음 + 빠진 쪽 재요청). 넘으면 남은 쪽은 원문 문단으로 둔다.
+    normalization_max_calls: int = Field(default=24, gt=0)
     # 워커의 지원서 분석만 OpenRouter Batch로 실행한다. Chat과 다른 작업은 기존 LLM 설정을 쓴다.
     application_batch_enabled: bool = False
     application_batch_model: str = "deepseek/deepseek-v4.1-flash"
