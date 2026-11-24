@@ -9,6 +9,7 @@ from itertools import pairwise
 from statistics import median
 from typing import TYPE_CHECKING
 
+from hiremate_ai.agents.analysis.application.layout_outline import refine_outline
 from hiremate_ai.contract import (
     DocumentList,
     DocumentListItem,
@@ -108,6 +109,7 @@ def revise_structure(
         blocks = _apply_bullets(blocks, items, source)
     title, blocks = _document_title(plan.title, blocks, segments, groups, source)
     blocks = _title_untitled_sections(blocks, groups, source)
+    blocks = refine_outline(blocks, source, request.pages)
     if title == original.title and blocks == original.blocks:
         return original
     return original.model_copy(update={"title": title, "blocks": blocks})
