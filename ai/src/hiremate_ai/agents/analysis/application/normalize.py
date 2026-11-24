@@ -7,6 +7,7 @@
 
 import json
 import logging
+import math
 import re
 import unicodedata
 from bisect import bisect_right
@@ -649,16 +650,22 @@ def _reason(error: Exception) -> str:
 
 
 def _page_parts(payload: dict[str, Any]) -> list[list[dict[str, Any]]]:
-    """요청 글자 수가 한도 안이면 전체 한 묶음, 넘으면 한도 안에서 연속한 쪽을 앞에서부터 묶는다."""
+    """요청 글자 수가 한도 안이면 전체 한 묶음, 넘으면 연속한 쪽을 비슷한 크기의 묶음으로 나눈다.
+
+    묶음 수는 한도로 나눈 올림이고, 묶음마다 평균 크기를 넘기 전에 끊는다. 한도를 꽉 채운 큰 묶음과 작은 묶음으로
+    나누면 큰 묶음이 다시 모델이 멈추는 길이에 가까워진다. 어떤 묶음도 한도를 넘지 않는다
+    (한 쪽이 한도보다 크면 그 쪽만 한 묶음이다).
+    """
     limit = settings.normalization_part_chars
     if len(json.dumps(payload, ensure_ascii=False)) <= limit:
         return [payload["pages"]]
+    lengths = [len(json.dumps(page, ensure_ascii=False)) for page in payload["pages"]]
+    target = sum(lengths) / math.ceil(sum(lengths) / limit)
     parts: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     size = 0
-    for page in payload["pages"]:
-        length = len(json.dumps(page, ensure_ascii=False))
-        if current and size + length > limit:
+    for page, length in zip(payload["pages"], lengths, strict=True):
+        if current and (size + length > limit or size + length / 2 > target):
             parts.append(current)
             current, size = [], 0
         current.append(page)

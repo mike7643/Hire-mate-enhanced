@@ -179,3 +179,19 @@ async def test_a_document_over_the_page_limit_is_rejected_before_asking(monkeypa
     with pytest.raises(NormalizationLimitError, match="4쪽"):
         await normalize_with_report(llm, _request(*_four_pages()))
     assert not llm.calls
+
+
+async def test_parts_are_balanced_instead_of_filling_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """다섯 쪽, 한도는 네 쪽 남짓. 네 쪽과 한 쪽이 아니라 세 쪽과 두 쪽으로 나눈다."""
+    pages = [_page(n, f"{n}쪽 첫 줄 " + _LINE * 3, f"{n}쪽 둘째 줄 " + _LINE * 3) for n in range(1, 6)]
+    two = await _two_pages_limit(pages[:4])
+    monkeypatch.setattr(settings, "normalization_part_chars", two * 2 - two // 5)
+    llm = FakeLlm(
+        _plan({"type": "paragraph", "segments": ["1-6"]}),
+        _plan({"type": "paragraph", "segments": ["7-10"]}),
+    )
+    await normalize_with_report(llm, _request(*pages))
+    assert [call.agent for call in llm.calls] == [
+        "application.normalize.part_1_3",
+        "application.normalize.part_4_5",
+    ]
