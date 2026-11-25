@@ -59,6 +59,9 @@ _LETTER_GAP = 12.0
 _MARGIN_GAP = 12.0
 # 모델이 이보다 많은 조각을 빠뜨리면 구조를 믿을 수 없어 실패로 둔다. 실패한 서류는 PDF 추출 글로 읽는다.
 _MAX_MISSING_RATIO = 0.5
+# 쪽 안에서 모델이 이만큼 넘게 연달아 빠뜨린 조각은 그 구간만 다시 묻는다(대개 답을 중간에 멈춘 경우). 더 짧은 구간은
+# 조립이 읽는 자리에 문단으로 되살린다.
+_RETRY_RUN = 8
 # 조각 번호는 ASCII이며, 로컬 JSON 문법 생성기에서 \d 대신 명시적 범위를 쓴다.
 _REF = r"^[0-9]+(-[0-9]+)?$"
 _BRACKET_HEADING = re.compile(r"\[([^\[\]\n]{1,80})\]")
@@ -90,6 +93,13 @@ def _is_separator(text: str) -> bool:
 
 class NormalizationLimitError(ValueError):
     """서류가 정제 한도(쪽 수)를 넘는다. 다시 해도 같으므로 정제 실패로 두고 PDF 추출 글을 쓴다."""
+
+
+class NormalizationCoverageError(ValueError):
+    """다시 물은 뒤에도 모델 답이 원문 조각의 반 넘게 빠뜨렸다.
+
+    같은 입력엔 같은 답이므로 정제 실패로 두고 PDF 추출 글을 쓴다.
+    """
 
 
 class NormalizationIntegrityError(ValueError):
@@ -454,13 +464,15 @@ async def normalize_with_report(
             for page in request.pages
         ],
     }
+    tables = detect_tables(request.pages, segments)
+    # 선과 칸으로 찾은 표는 모델 답과 상관없이 코드가 세운다. 모델이 그 조각을 빠뜨려도 다시 묻지 않는다.
+    drawn = {n for table in tables for row in [table.headers, *table.rows] for cell in row for n in cell}
     if settings.llm_profile == "local":
         with model_call_budget(settings.normalization_max_calls):
-            plan = await _ask_local(llm, payload, by_page)
+            plan = await _ask_local(llm, payload, by_page, drawn)
     else:
         with model_call_budget(settings.llm_agent_max_calls):
             plan = await _ask(llm, "application.normalize", payload)
-    tables = detect_tables(request.pages, segments)
     if tables:
         from hiremate_ai.agents.analysis.application.plan_tables import apply_geometry_tables
 
@@ -605,7 +617,10 @@ async def _ask(llm: StructuredLlmClient, agent: str, payload: dict[str, Any]) ->
 
 
 async def _ask_local(
-    llm: StructuredLlmClient, payload: dict[str, Any], by_page: dict[int, list[Segment]]
+    llm: StructuredLlmClient,
+    payload: dict[str, Any],
+    by_page: dict[int, list[Segment]],
+    drawn: set[int] | None = None,
 ) -> DocumentPlan:
     """로컬 모델에 묻는다. 길면 쪽 묶음으로 나눠 묻고, 답이 빠뜨리거나 실패한 쪽은 쪽마다 다시 묻는다.
 
@@ -642,7 +657,7 @@ async def _ask_local(
                 continue
             plans.append(part)
         plan = _merge_parts(plans)
-    return await _retry_missing_pages(llm, plan, payload, by_page)
+    return await _retry_missing(llm, plan, payload, by_page, drawn or set())
 
 
 def _reason(error: Exception) -> str:
@@ -722,30 +737,49 @@ def _continue_last(blocks: list[BlockPlan], lead: list[BlockPlan]) -> list[Block
     return [*blocks, *lead]
 
 
-async def _retry_missing_pages(
-    llm: StructuredLlmClient, plan: DocumentPlan, payload: dict[str, Any], by_page: dict[int, list[Segment]]
+async def _retry_missing(
+    llm: StructuredLlmClient,
+    plan: DocumentPlan,
+    payload: dict[str, Any],
+    by_page: dict[int, list[Segment]],
+    drawn: set[int],
 ) -> DocumentPlan:
-    """정상 응답이 통째로 건너뛴 페이지에 한해, 원래 조각 번호로 한 번 더 묻는다."""
+    """정상 응답이 빠뜨린 곳을 원래 조각 번호로 한 번 더 묻는다.
+
+    통째로 건너뛴 쪽은 그 쪽 전체를, 쪽 안에서 길게 이어 빠뜨린 구간(_RETRY_RUN 넘게)은 그 구간만 묻는다. 다시 묻기가
+    실패하면 그 자리는 조립이 문단으로 되살린다. 쪽 안의 구간을 셀 때는 선과 칸으로 찾은 표 후보 조각(drawn)을 빠진
+    것으로 보지 않는다(모델이 표를 건너뛰어도 코드가 표로 세운다).
+    """
     count = payload["segment_count"]
     covered = {number for ref in _plan_refs(plan) for number in _ref_ids(ref, count)}
-    extra: list[tuple[int, list[BlockPlan]]] = []
+    asks: list[tuple[str, dict[str, Any], set[int]]] = []
     for page in payload["pages"]:
         number = page["page"]
         allowed = {segment.id for segment in by_page.get(number, [])}
-        if not allowed or allowed & covered:
+        if not allowed:
             continue
+        if not allowed & covered:
+            # 표 후보는 계획과 맞을 때만 표가 되므로, 통째로 건너뛴 쪽은 표 후보가 있어도 다시 묻는다.
+            asks.append((f"application.normalize.retry.page_{number}", page, allowed))
+            continue
+        for run in _runs(sorted(allowed - covered - drawn)):
+            if len(run) > _RETRY_RUN:
+                part = {**page, "segments": [segment for segment in page["segments"] if segment["id"] in run]}
+                asks.append((f"application.normalize.retry.page_{number}_{run[0]}_{run[-1]}", part, set(run)))
+    extra: list[tuple[int, list[BlockPlan]]] = []
+    for agent, page, allowed in asks:
         try:
-            repair = await _ask(llm, f"application.normalize.retry.page_{number}", _scoped(payload, [page], allowed))
+            repair = await _ask(llm, agent, _scoped(payload, [page], allowed))
         except LlmOutputError as error:
             if error.reason == LlmFailureReason.BUDGET:
                 break
-            logger.warning("정제 페이지 재요청 실패 page=%d reason=%s", number, error.reason)
+            logger.warning("정제 재요청 실패 agent=%s reason=%s", agent, error.reason)
             continue
         except (httpx.HTTPError, TimeoutError) as error:
-            logger.warning("정제 페이지 재요청 실패 page=%d reason=%s", number, type(error).__name__)
+            logger.warning("정제 재요청 실패 agent=%s reason=%s", agent, type(error).__name__)
             continue
         if not _within(repair, allowed, count):
-            logger.warning("정제 페이지 재요청의 조각 범위가 올바르지 않다 page=%d", number)
+            logger.warning("정제 재요청 답의 조각 범위가 올바르지 않다 agent=%s", agent)
             continue
         made: list[BlockPlan] = [ParagraphPlan(type="paragraph", segments=repair.title)] if repair.title else []
         extra.append((min(allowed), [*made, *repair.blocks]))
@@ -755,8 +789,18 @@ async def _retry_missing_pages(
     return plan.model_copy(update={"blocks": blocks}) if extra else plan
 
 
+def _runs(numbers: list[int]) -> list[list[int]]:
+    runs: list[list[int]] = []
+    for number in numbers:
+        if runs and runs[-1][-1] == number - 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    return runs
+
+
 def _place_page(blocks: list[BlockPlan], made: list[BlockPlan], first: int, count: int) -> list[BlockPlan]:
-    """다시 물어 얻은 쪽의 블록을 읽는 자리에 넣는다. 조각 번호가 곧 읽는 순서다.
+    """다시 물어 얻은 쪽(또는 구간)의 블록을 읽는 자리에 넣는다. 조각 번호가 곧 읽는 순서다.
 
     그 쪽보다 뒤 번호로 시작하는 첫 블록 앞에 넣는다. 앞 번호로 시작해 뒤 번호까지 걸친 섹션이면 그 섹션 안에서
     같은 방법으로 넣는다.
@@ -793,7 +837,7 @@ def assemble(
         body = _body_ids(blocks)
         report.heading_candidates_in_body = sorted({n for group in heading_candidates for n in group if n in body})
     if len(report.missing) > len(segments) * _MAX_MISSING_RATIO:
-        raise ValueError("정제 구조가 원문 조각의 절반 넘게 빠뜨렸다")
+        raise NormalizationCoverageError("정제 구조가 원문 조각의 절반 넘게 빠뜨렸다")
     data = [rendered for node in blocks if (rendered := builder.render(node)) is not None]
     if not any(block["type"] != "artifact" for block in data):
         raise ValueError("정제된 문서에 내용이 없다")

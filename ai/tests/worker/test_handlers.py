@@ -357,3 +357,28 @@ async def test_normalization_that_changes_the_source_text_is_permanent(monkeypat
                 ],
             }
         )
+
+
+async def test_normalization_that_left_out_most_of_the_document_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """다시 물어도 반 넘게 빠진 답은 같은 입력에 같은 답이라 작업 재시도로 모델을 또 부르지 않는다."""
+    from hiremate_ai.agents.analysis.application.normalize import NormalizationCoverageError
+
+    async def broken(llm: Any, request: Any) -> Any:
+        raise NormalizationCoverageError("정제 구조가 원문 조각의 절반 넘게 빠뜨렸다")
+
+    monkeypatch.setattr(worker_handlers, "normalize_document", broken)
+    handlers = job_handlers(FakeLlm(), MemoryStore(), SESSIONS, normalization_llm_factory=FakeLlm)
+    with pytest.raises(PermanentError, match="절반"):
+        await handlers["application/normalize"](
+            {
+                "companyId": str(uuid4()),
+                "recruitmentId": str(uuid4()),
+                "applicationId": str(uuid4()),
+                "documentId": str(uuid4()),
+                "revision": 1,
+                "documentType": "RESUME",
+                "pages": [
+                    {"number": 1, "text": "추출 내용", "issues": [], "spans": [], "imageCount": 0, "formCount": 0}
+                ],
+            }
+        )

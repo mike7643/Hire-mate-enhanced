@@ -12,6 +12,7 @@ import pytest
 
 from hiremate_ai.agents.analysis.application.normalize import (
     DocumentPlan,
+    NormalizationCoverageError,
     NormalizationLimitError,
     normalize_with_report,
 )
@@ -195,3 +196,44 @@ async def test_parts_are_balanced_instead_of_filling_the_limit(monkeypatch: pyte
         "application.normalize.part_1_3",
         "application.normalize.part_4_5",
     ]
+
+
+def _long_page() -> dict[str, Any]:
+    """한 쪽 열여섯 줄. 조각 번호 1-16."""
+    return _page(1, *(f"{n}번째 줄 " + _LINE * 3 for n in range(1, 17)))
+
+
+async def test_a_long_run_the_model_left_out_of_a_page_is_asked_again() -> None:
+    """모델이 쪽 중간에서 답을 멈추면 빠진 연속 구간만 원래 조각 번호로 다시 묻고 읽는 자리에 넣는다."""
+    llm = FakeLlm(
+        _plan({"type": "section", "title": ["1"], "blocks": [{"type": "paragraph", "segments": ["2-6"]}]}),
+        _plan({"type": "section", "title": ["7"], "blocks": [{"type": "paragraph", "segments": ["8-16"]}]}),
+    )
+    document, report = await normalize_with_report(llm, _request(_long_page()))
+    assert [call.agent for call in llm.calls] == ["application.normalize", "application.normalize.retry.page_1_7_16"]
+    asked = _payload(llm.calls[1])
+    assert [segment["id"] for page in asked["pages"] for segment in page["segments"]] == list(range(7, 17))
+    assert asked["segment_count"] == 10
+    assert not report.missing
+    assert [block.title for block in document.blocks if isinstance(block, DocumentSection)] == [
+        "1번째 줄 " + (_LINE * 3).strip(),
+        "7번째 줄 " + (_LINE * 3).strip(),
+    ]
+
+
+async def test_a_short_run_the_model_left_out_is_restored_without_asking() -> None:
+    llm = FakeLlm(_plan({"type": "paragraph", "segments": ["1-12"]}))
+    _, report = await normalize_with_report(llm, _request(_long_page()))
+    assert [call.agent for call in llm.calls] == ["application.normalize"]
+    assert report.missing == [13, 14, 15, 16]
+
+
+async def test_a_document_the_model_mostly_left_out_fails_for_good() -> None:
+    """다시 물어도 반 넘게 빠지면 같은 입력엔 같은 답이므로 다시 시도하지 않을 실패로 올린다."""
+
+    def broken(call: LlmCall) -> DocumentPlan:
+        raise LlmOutputError("구조화 응답이 잘렸다", reason=LlmFailureReason.FORMAT)
+
+    llm = FakeLlm(_plan({"type": "paragraph", "segments": ["1-4"]}), broken)
+    with pytest.raises(NormalizationCoverageError):
+        await normalize_with_report(llm, _request(_long_page()))
