@@ -77,3 +77,50 @@ def test_notices_for_the_same_page_collapse_into_the_first_one_with_the_known_ki
     lines = [(_BODY, 10.0), (_BODY, 10.0)]
     shaped = _revise(lines, _p("1"), _notice("unknown", 1), _s(None, _p("2"), _notice("image", 1), _notice("image", 1)))
     assert shaped == [["1"], ("image", [1]), (None, [["2"]])]
+
+
+def test_a_title_repeated_at_the_start_of_its_first_paragraph_is_not_split_into_a_second_section() -> None:
+    lines = [("프로젝트", 11.0), ("상품 상세 전환", 10.0), (_BODY, 9.0), (_BODY, 9.0)]
+    assert _revise(lines, _s(["1"], _p("1", "2-4"))) == [(["1"], [["2-4"]])]
+
+
+def test_a_larger_heading_line_left_before_an_untitled_group_becomes_its_title() -> None:
+    lines = [(_BODY, 10.0), ("6. 고찰 및 한계", 12.5), (_BODY, 10.0), (_BODY, 10.0)]
+    assert _revise(lines, _s(None, _p("1"), _p("2")), _s(None, _p("3-4"))) == [
+        (None, [["1"]]),
+        (["2"], [["3-4"]]),
+    ]
+    # 가장 큰 줄("이력서")은 문서 제목으로 빠진다.
+    between = [("이력서", 20.0), (_BODY, 10.0), ("경력사항", 14.0), (_BODY, 10.0), (_BODY, 10.0)]
+    shaped = _revise(between, _p("1"), _p("2"), _p("3"), _s(None, _p("4-5")))
+    assert shaped == [["2"], (["3"], [["4-5"]])]
+
+
+def test_a_body_size_line_before_an_untitled_group_stays_where_it_is() -> None:
+    lines = [(_BODY, 10.0), ("다음 내용", 10.0), (_BODY, 10.0), (_BODY, 10.0)]
+    shaped = _revise(lines, _s(None, _p("1"), _p("2")), _s(None, _p("3-4")))
+    assert shaped == [(None, [["1"], ["2"]]), (None, [["3-4"]])]
+
+
+def test_a_centred_page_title_much_larger_than_the_text_titles_its_untitled_group() -> None:
+    spans = [
+        dict(text="경력기술서", x=238, y=67, endX=351, size=18.0),
+        dict(text=_BODY, x=43, y=110, endX=500, size=10.0),
+        dict(text=_BODY, x=43, y=130, endX=500, size=10.0),
+    ]
+    page = PdfPage.model_validate(
+        dict(number=1, text="\n".join(s["text"] for s in spans), spans=spans, layout=dict(width=600, height=900))
+    )
+    request = DocumentNormalizationRequest.model_validate(
+        dict(
+            companyId=uuid4(),
+            recruitmentId=uuid4(),
+            applicationId=uuid4(),
+            documentId=uuid4(),
+            revision=1,
+            documentType=DocumentType.RESUME,
+            pages=[page],
+        )
+    )
+    plan = DocumentPlan.model_validate({"title": None, "blocks": [_s(None, _p("1"), _p("2-3"))]})
+    assert _shape(revise_structure(plan, build_segments([page]), request).blocks) == [(["1"], [["2-3"]])]

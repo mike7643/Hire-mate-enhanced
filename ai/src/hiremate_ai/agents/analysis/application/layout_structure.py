@@ -98,7 +98,7 @@ def revise_structure(
     by_page = _segments_by_page(segments)
     groups = _candidate_groups(request.pages, by_page)
     original = plan
-    cleaned, stray = _release_stray_cells(plan.blocks, source)
+    cleaned, stray = _release_stray_cells(_drop_repeated_titles(plan.blocks, source), source)
     if cleaned != plan.blocks:
         plan = plan.model_copy(update={"blocks": cleaned})
     released = sorted([*(released or []), *stray])
@@ -123,7 +123,7 @@ def revise_structure(
     title, blocks = _document_title(plan.title, blocks, segments, groups, source)
     blocks = _fill_empty_sections(_hoist_untitled_tails(blocks))
     blocks = _title_untitled_sections(blocks, groups, source)
-    blocks = _demote_prose_titles(blocks, source)
+    blocks = _adopt_trailing_headings(_demote_prose_titles(blocks, source), source)
     brackets = {group[0] for group in _bracket_headings(by_page)}
     used = set(_ids(_plan_refs(title, blocks), source))
     blocks = _join_page_continuations(blocks, set(groups) - brackets, brackets, used, source, by_page)
@@ -155,6 +155,57 @@ def _hoist_untitled_tails(blocks: list[BlockPlan]) -> list[BlockPlan]:
         result.append(block if children == block.blocks else block.model_copy(update={"blocks": children}))
         result.extend(_hoist_untitled_tails(tail) if tail else [])
     return result
+
+
+def _adopt_trailing_headings(blocks: list[BlockPlan], source: dict[int, Segment]) -> list[BlockPlan]:
+    """제목 없는 섹션 바로 앞에 놓인 제목 줄을 그 섹션의 제목으로 옮긴다.
+
+    모델이 다음 항목의 제목 줄("경력사항", "6. 고찰 및 한계")을 앞 묶음의 마지막 문단이나 두 묶음 사이 문단으로 두고,
+    내용만 제목 없는 섹션으로 묶은 경우다. 제목 줄은 한 줄이고 짧으며 문장으로 끝나지 않고, 뒤 섹션 글자보다 0.35pt
+    넘게 커야 한다. 읽는 순서는 그대로다.
+    """
+    from hiremate_ai.agents.analysis.application.normalize import SectionPlan
+
+    entries: list[BlockPlan] = []
+    for block in blocks:
+        if block.type == "section":
+            children = _adopt_trailing_headings(block.blocks, source)
+            block = block if children == block.blocks else block.model_copy(update={"blocks": children})
+        entries.append(block)
+    result: list[BlockPlan] = []
+    for index, block in enumerate(entries):
+        following = entries[index + 1] if index + 1 < len(entries) else None
+        target = following if isinstance(following, SectionPlan) and not following.title and following.blocks else None
+        if target is not None and _heading_line(block, target, source):
+            assert block.type == "paragraph"
+            entries[index + 1] = target.model_copy(update={"title": block.segments})
+            continue
+        if (
+            target is not None
+            and block.type == "section"
+            and len(block.blocks) > 1
+            and _heading_line(block.blocks[-1], target, source)
+        ):
+            last = block.blocks[-1]
+            assert last.type == "paragraph"
+            entries[index + 1] = target.model_copy(update={"title": last.segments})
+            block = block.model_copy(update={"blocks": block.blocks[:-1]})
+        result.append(block)
+    return result
+
+
+def _heading_line(block: BlockPlan, section: BlockPlan, source: dict[int, Segment]) -> bool:
+    if block.type != "paragraph" or block.keep_lines:
+        return False
+    ids = list(_ids([block.segments], source))
+    if not ids or any(not _same_line(source[n], source[ids[0]]) for n in ids):
+        return False
+    text = "".join("".join(source[n].text.split()) for n in ids)
+    if not 0 < len(text) <= _LABEL_CHARS * 3 or text[-1:] in _SENTENCE_END or not any(c.isalpha() for c in text):
+        return False
+    sizes = [size for n in _ids(_block_refs(section), source) if (size := source[n].size)]
+    head = [size for n in ids if (size := source[n].size)]
+    return len(sizes) >= 2 and bool(head) and min(head) >= median(sizes) + 0.35
 
 
 def _fill_empty_sections(blocks: list[BlockPlan]) -> list[BlockPlan]:
@@ -226,6 +277,36 @@ def _merge_duplicate_notices(blocks: list[BlockPlan]) -> list[BlockPlan]:
 
     gather(blocks)
     return rebuild(blocks, set())
+
+
+def _drop_repeated_titles(blocks: list[BlockPlan], source: dict[int, Segment]) -> list[BlockPlan]:
+    """섹션 첫 문단이 섹션 제목 조각으로 다시 시작하면 문단에서 그 조각을 뺀다.
+
+    모델이 제목 조각을 첫 문단에도 넣은 경우다. 조립은 두 번 쓴 조각의 처음 자리(제목)만 남기므로 글은 같다. 미리
+    빼 두어야 뒤 규칙이 그 줄을 새 제목으로 보고 같은 제목 섹션을 하나 더 만들지 않는다. 제목이 뒤 줄보다 0.35pt
+    넘게 클 때만 뺀다. 같은 크기면 본문 줄을 제목으로 쓴 것일 수 있어 쪽 경계 규칙에 맡긴다.
+    """
+    result: list[BlockPlan] = []
+    for block in blocks:
+        if block.type != "section":
+            result.append(block)
+            continue
+        children = _drop_repeated_titles(block.blocks, source)
+        title = list(_ids([block.title or []], source))
+        first = children[0] if children else None
+        if title and first is not None and first.type == "paragraph" and not first.keep_lines:
+            ids = list(_ids([first.segments], source))
+            rest = ids[len(title) :]
+            if ids[: len(title)] == title and rest and _larger(title, rest[0], source):
+                children = [first.model_copy(update={"segments": _compact(rest)}), *children[1:]]
+        result.append(block if children == block.blocks else block.model_copy(update={"blocks": children}))
+    return result
+
+
+def _larger(ids: list[int], following: int, source: dict[int, Segment]) -> bool:
+    sizes = [size for n in ids if (size := source[n].size)]
+    after = source[following].size
+    return bool(sizes) and after is not None and min(sizes) >= after + 0.35
 
 
 def _release_stray_cells(
@@ -977,7 +1058,9 @@ def _larger_lead_line(ids: list[int], rest: list[BlockPlan], source: dict[int, S
     head = [s.size for s in lead if s.size]
     if len(sizes) < 2 or not head:
         return False
-    return min(head) >= median(sizes) + 0.35 and lead[0].x <= min(s.x for s in body) + 1
+    # 본문 왼쪽 끝에 맞춘 줄이거나, 가운데 둔 줄이면 2pt 넘게 커야 한다(양식 이력서 \"경력기술서\" 같은 쪽 제목).
+    larger = min(head) - median(sizes)
+    return larger >= 0.35 and (lead[0].x <= min(s.x for s in body) + 1 or larger >= 2.0)
 
 
 def _same_line(segment: Segment, other: Segment) -> bool:
