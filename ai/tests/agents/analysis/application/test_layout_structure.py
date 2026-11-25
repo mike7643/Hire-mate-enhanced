@@ -5,7 +5,13 @@ from uuid import uuid4
 import pytest
 
 from hiremate_ai.agents.analysis.application.layout_structure import ensure_visual_notices, revise_structure
-from hiremate_ai.agents.analysis.application.normalize import DocumentPlan, Segment, build_segments
+from hiremate_ai.agents.analysis.application.normalize import (
+    DocumentPlan,
+    ParagraphPlan,
+    SectionPlan,
+    Segment,
+    build_segments,
+)
 from hiremate_ai.contract import (
     DocumentNormalizationRequest,
     DocumentParagraph,
@@ -137,6 +143,17 @@ def test_does_not_rebuild_cover_letter_forms_without_three_unambiguous_bands(fau
     assert revise_structure(plan, segments, request) is plan
 
 
+def test_unnamed_section_is_titled_when_the_next_question_line_is_in_plain_text() -> None:
+    """다음 문항을 모델이 섹션으로 세우지 않았어도, 번호와 글자 모양이 이어지는 다음 문항 줄이 범위를 정한다."""
+    request, segments = _request(DocumentType.COVER_LETTER, _questions_page())
+    original = _plan(dict(type="section", title=None, blocks=[_paragraph("2-6")]), _paragraph("7-10"), title=["1"])
+    corrected = revise_structure(original, segments, request)
+    expected = SectionPlan(
+        type="section", title=["2"], blocks=[ParagraphPlan(type="paragraph", segments=["3", "4", "5", "6"])]
+    )
+    assert corrected.blocks[0] == expected
+
+
 def test_does_not_replace_document_title_or_revise_an_unrelated_kind() -> None:
     page = _form_page()
     cover, segments = _request(DocumentType.COVER_LETTER, page)
@@ -157,7 +174,8 @@ def _questions_page(*, fault: str = "") -> PdfPage:
         _span("The next lines are still part of the answer.", 45, 181, 270),
         _span("2) Delivery", 45, 215, 130, 10.5),
         _span("The model kept this answer.", 45, 241, 238),
-        _span("[Unstyled prose label]", 45, 260, 170),
+        # 괄호 소제목 규칙(test_layout_brackets)과 섞이지 않게 대괄호를 쓰지 않는다.
+        _span("(Unstyled prose label)", 45, 260, 170),
         _span("The model kept this paragraph as ordinary text.", 45, 277, 290),
     ]
     if fault == "size":
@@ -221,7 +239,7 @@ async def test_unnamed_section_is_titled_when_the_model_left_the_rest_of_its_ans
     ]
 
 
-@pytest.mark.parametrize("fault", ["different_heading_style", "claimed_elsewhere", "no_neighbouring_section"])
+@pytest.mark.parametrize("fault", ["different_heading_style", "claimed_elsewhere"])
 def test_unnamed_section_is_not_relabelled_without_scope_and_sibling_evidence(fault: str) -> None:
     from dataclasses import replace
 

@@ -53,10 +53,17 @@ _MARK_GAP = 12.0
 _ITEM_LINE_GAP = 2.0
 # 제목 앞에 붙이는 기호와 그런 제목의 최대 글자 수. 줄표, 별표, 참고 표시(※)는 목록과 주석에 흔해 넣지 않는다.
 _HEADING_MARKS = frozenset("■□◆◇●○▶►▷★☆◎▣◈◼◻•")
+# 소제목을 감싸는 괄호. 둥근 괄호는 본문에서 흔해 넣지 않는다.
+_BRACKET_PAIRS = {"〈": "〉", "<": ">", "《": "》", "「": "」", "『": "』", "【": "】", "[": "]"}
+# 소제목 왼쪽 같은 줄에 두는 칸 이름표(성장과정, 지원동기)의 최대 글자 수.
+_LABEL_CHARS = 12
+_BRACKET_LINE = re.compile(r"\s*([〈<《「『【\[])([^〈〉<>《》「」『』【】\[\]\n]{1,60})([〉>》」』】\]])\s*")
 _MARK_HEADING_CHARS = 30
 # 같은 줄로 보는 세로 차이와, 같은 단으로 보는 들여쓰기 한도(pt).
 _SAME_LINE_GAP = 1.0
 _HEADING_INDENT = 24.0
+# 단 너비에 대한 비율. 줄 끝이 단 오른쪽 끝에서 이만큼 안이면 줄이 끝까지 찼다고(문단이 이어진다고) 본다.
+_FULL_LINE = 0.08
 # 시각 자료 안내는 모델 문장 대신 종류별로 고정한 문장만 쓴다.
 _NOTICE_TEXT = {
     "image": "원본 PDF {pages}쪽에 이미지가 있습니다. 내용은 원본에서 확인해 주세요.",
@@ -109,6 +116,11 @@ def revise_structure(
         blocks = _apply_bullets(blocks, items, source)
     title, blocks = _document_title(plan.title, blocks, segments, groups, source)
     blocks = _title_untitled_sections(blocks, groups, source)
+    brackets = {group[0] for group in _bracket_headings(by_page)}
+    used = set(_ids(_plan_refs(title, blocks), source))
+    blocks = _join_page_continuations(blocks, set(groups) - brackets, brackets, used, source, by_page)
+    if brackets:
+        blocks = _bracket_sections(blocks, brackets, source)
     blocks = refine_outline(blocks, source, request.pages)
     if title == original.title and blocks == original.blocks:
         return original
@@ -172,16 +184,34 @@ def _release_stray_cells(
     return cleaned, runs
 
 
-def _title_style(title: list[str] | None, source: dict[int, Segment]) -> tuple[float, str | None, float] | None:
+_Style = tuple[float, str | None, float, str | None]
+
+
+def _title_style(title: list[str] | None, source: dict[int, Segment]) -> _Style | None:
+    """제목 첫 줄의 글자 크기, 색, 왼쪽 끝, 감싼 괄호. 괄호 소제목은 모양이 같아도 번호 제목과 다른 단계다."""
     ids = sorted(_ids([title or []], source))
     if not ids or source[ids[0]].size is None:
         return None
     head = source[ids[0]]
-    return head.size or 0.0, head.color, head.x
+    return head.size or 0.0, head.color, head.x, bracket_kind(head.text)
 
 
-def _same_style(left: tuple[float, str | None, float] | None, right: tuple[float, str | None, float] | None) -> bool:
-    return left is not None and right is not None and left[:2] == right[:2] and abs(left[2] - right[2]) <= 2
+def _same_style(left: _Style | None, right: _Style | None) -> bool:
+    return (
+        left is not None
+        and right is not None
+        and left[:2] == right[:2]
+        and abs(left[2] - right[2]) <= 2
+        and left[3] == right[3]
+    )
+
+
+def bracket_kind(text: str) -> str | None:
+    """줄 전체가 짝 맞는 괄호 하나로 감싸여 있고 안에 글자가 있으면 그 여는 괄호를 돌려준다."""
+    match = _BRACKET_LINE.fullmatch(text)
+    if match is None or _BRACKET_PAIRS[match[1]] != match[3] or not any(char.isalpha() for char in match[2]):
+        return None
+    return match[1]
 
 
 def _lift_same_style(blocks: list[BlockPlan], source: dict[int, Segment]) -> list[BlockPlan]:
@@ -494,10 +524,210 @@ def _candidate_groups(pages: list[PdfPage], by_page: dict[int, list[Segment]]) -
     from hiremate_ai.agents.analysis.application.normalize import _heading_candidates
 
     groups = {group[0]: group for group in _heading_candidates(by_page, bulleted_lines(pages, by_page))}
-    for group in _mark_headings(by_page):
+    for group in [*_mark_headings(by_page), *_bracket_headings(by_page)]:
         if not any(group[0] in existing for existing in groups.values()):
             groups[group[0]] = group
     return groups
+
+
+def _bracket_headings(by_page: dict[int, list[Segment]]) -> list[list[int]]:
+    """같은 괄호로 감싼 짧은 한 줄이 같은 들여쓰기로 두 번 이상 본문 앞에 나오면 소제목 줄로 본다.
+
+    〈소제목〉, [소제목]처럼 본문과 글자 모양이 같아 글자 모양으로는 찾지 못하는 소제목이다. 아래(쪽 맨 아래 줄이면
+    다음 쪽 첫머리)에 같은 단의 줄이 없으면(본문이 이어지지 않으면) 소제목으로 보지 않는다.
+    """
+    found: list[tuple[str, Segment]] = []
+    numbers = sorted(by_page)
+    ordered = {n: sorted((s for s in by_page[n] if s.x < s.end_x), key=lambda s: (s.y, s.x)) for n in numbers}
+    for position, number in enumerate(numbers):
+        lines = ordered[number]
+        following = ordered[numbers[position + 1]] if position + 1 < len(numbers) else []
+        for index, line in enumerate(lines):
+            kind = bracket_kind(line.text)
+            if kind is None:
+                continue
+            below = _column_neighbour(iter(lines[index + 1 :]), line)
+            if below is None:
+                # 쪽 맨 아래 소제목은 본문이 다음 쪽 같은 단에서 시작한다.
+                below = next((s for s in following if abs(s.x - line.x) <= _HEADING_INDENT), None)
+            if below is None:
+                continue
+            found.append((kind, line))
+    return [
+        [line.id]
+        for kind, line in found
+        if sum(1 for other_kind, other in found if other_kind == kind and abs(other.x - line.x) <= 2) >= 2
+    ]
+
+
+def _bracket_sections(blocks: list[BlockPlan], heads: set[int], source: dict[int, Segment]) -> list[BlockPlan]:
+    """소제목 줄로 시작하는 문단을 그 소제목의 섹션으로 세운다. 섹션은 다음 소제목이나 섹션 앞까지 이어진다.
+
+    소제목 줄과 본문이 한 문단에 붙어 있으면 소제목만 떼어 제목으로 쓴다. 모델이 이미 소제목으로 만든 섹션(안에
+    섹션이 없는 것)은 같은 방법으로 다시 세워 형제로 둔다. 문단에서 떼어 낸 소제목 뒤에 내용이 없으면 문단으로
+    남긴다. 모델이 만든 섹션은 비어 있어도 섹션으로 둔다. 모델이 빠뜨린 본문 조각은 조립 때 제목 뒤에 되살아난다.
+    """
+    from hiremate_ai.agents.analysis.application.normalize import ParagraphPlan, SectionPlan
+
+    result: list[BlockPlan] = []
+    open_title: list[str] | None = None
+    body: list[BlockPlan] = []
+    kept = False
+
+    def close() -> None:
+        nonlocal open_title, body, kept
+        if open_title is not None:
+            if body or kept:
+                result.append(SectionPlan(type="section", title=open_title, blocks=body))
+            else:
+                result.append(ParagraphPlan(type="paragraph", segments=open_title))
+        open_title, body, kept = None, [], False
+
+    def place(block: BlockPlan) -> None:
+        (body if open_title is not None else result).append(block)
+
+    def lead(refs: list[str] | None) -> int | None:
+        ids = list(_ids([refs or []], source))
+        return ids[0] if ids else None
+
+    def title_end(ids: list[int]) -> int:
+        """문단 앞에서 제목으로 뗄 조각 수. 소제목 줄, 또는 같은 줄 왼쪽 칸 이름표와 그 옆 소제목 줄이다."""
+        if ids[0] in heads:
+            return 1
+        if len(ids) > 1 and ids[1] in heads and ids[1] == ids[0] + 1:
+            label, head = source[ids[0]], source[ids[1]]
+            if (
+                label.page == head.page
+                and abs(label.y - head.y) <= _SAME_LINE_GAP
+                and label.end_x <= head.x
+                and 0 < len(label.text.strip()) <= _LABEL_CHARS
+            ):
+                return 2
+        return 0
+
+    queue: list[BlockPlan] = list(blocks)
+    while queue:
+        block = queue.pop(0)
+        if block.type == "section":
+            inner = [b for b in block.blocks if b.type == "section"]
+            if lead(block.title) in heads and not inner and block.title is not None:
+                close()
+                open_title, body, kept = list(block.title), [], True
+                # 모델이 만든 소제목 섹션 안의 문단도 소제목으로 시작할 수 있으므로 같은 줄에서 다시 읽는다.
+                queue[:0] = list(block.blocks)
+                continue
+            children = _bracket_sections(block.blocks, heads, source)
+            close()
+            result.append(block if children == block.blocks else block.model_copy(update={"blocks": children}))
+            continue
+        if block.type == "paragraph" and not block.keep_lines:
+            ids = list(_ids([block.segments], source))
+            taken = set(_ids([open_title or []], source))
+            if ids and ids[0] in taken:
+                # 모델이 섹션 제목 조각을 첫 문단에도 넣었다. 제목에 쓴 조각만 빼고 그 섹션 본문으로 둔다.
+                rest = [n for n in ids if n not in taken]
+                if rest:
+                    body.append(ParagraphPlan(type="paragraph", segments=_compact(rest)))
+                continue
+            end = title_end(ids) if ids else 0
+            if end:
+                close()
+                open_title = [str(n) for n in ids[:end]]
+                if len(ids) > end:
+                    body.append(ParagraphPlan(type="paragraph", segments=_compact(ids[end:])))
+                continue
+        place(block)
+    close()
+    return result
+
+
+def _join_page_continuations(
+    blocks: list[BlockPlan],
+    headings: set[int],
+    heads: set[int],
+    used: set[int],
+    source: dict[int, Segment],
+    by_page: dict[int, list[Segment]],
+) -> list[BlockPlan]:
+    """모델이 쪽 경계에서 제목 없이 연 섹션의 앞부분이 앞 섹션 글의 이어짐이면 앞 섹션으로 옮긴다.
+
+    쪽마다, 또는 쪽 묶음마다 따로 답한 모델은 쪽이 바뀌는 자리에서 제목 없는 섹션을 새로 열곤 한다. 앞 섹션 마지막
+    줄이 단 오른쪽 끝까지 차 있고(문단이 끝나지 않았고) 제목 없는 섹션이 다음 쪽의 바로 다음 조각에서 시작하면, 그
+    앞부분은 앞 섹션 글이다. 옮기는 범위는 처음 나오는 섹션이나 제목 후보 줄 앞까지다. 괄호 소제목 줄은 함께 옮겨
+    소제목 규칙이 그 자리에서 세우게 한다. 앞 섹션 안에서는 맨 끝 섹션을 따라 내려가되 괄호 소제목 섹션 앞에서
+    멈춘다(그 섹션은 소제목 규칙이 형제로 다시 세운다).
+    """
+    result: list[BlockPlan] = []
+    for block in blocks:
+        if block.type == "section":
+            children = _join_page_continuations(block.blocks, headings, heads, used, source, by_page)
+            if children != block.blocks:
+                block = block.model_copy(update={"blocks": children})
+        previous = result[-1] if result else None
+        if block.type == "section" and not block.title and previous is not None and previous.type == "section":
+            leading: list[BlockPlan] = []
+            for child in block.blocks:
+                first = next(_ids(_block_refs(child), source), None)
+                if child.type not in ("paragraph", "list") or first is None or first in headings:
+                    break
+                leading.append(child)
+            if leading and _continues(previous, leading[0], used, source, by_page):
+                result[-1] = _append_deep(previous, leading, heads, source)
+                rest = block.blocks[len(leading) :]
+                if not rest:
+                    continue
+                block = block.model_copy(update={"blocks": rest})
+        result.append(block)
+    return result
+
+
+def _continues(
+    previous: BlockPlan,
+    block: BlockPlan,
+    used: set[int],
+    source: dict[int, Segment],
+    by_page: dict[int, list[Segment]],
+) -> bool:
+    """block이 다음 쪽에서 previous의 마지막 문단을 잇는가. 사이 조각은 계획이 쓰지 않은 것(쪽 번호 같은)만 있다."""
+    last_id = max(_ids(_block_refs(previous), source), default=None)
+    first_id = min(_ids(_block_refs(block), source), default=None)
+    if last_id is None or first_id is None or first_id <= last_id:
+        return False
+    if any(n in used for n in range(last_id + 1, first_id)):
+        return False
+    last, first = source[last_id], source[first_id]
+    if first.page <= last.page:
+        return False
+    page = by_page.get(last.page, [])
+    column = [s for s in page if abs(s.x - last.x) <= _HEADING_INDENT and s.x < s.end_x]
+    line_end = max(s.end_x for s in page if s.page == last.page and abs(s.y - last.y) <= _SAME_LINE_GAP)
+    if not column:
+        return False
+    left, right = min(s.x for s in column), max(s.end_x for s in column)
+    return right - left > 0 and line_end >= right - _FULL_LINE * (right - left)
+
+
+def _append_deep(section: BlockPlan, extra: list[BlockPlan], heads: set[int], source: dict[int, Segment]) -> BlockPlan:
+    """섹션 맨 끝 섹션을 따라 내려가 extra를 붙인다. 괄호 소제목 섹션 앞에서는 멈춘다."""
+    assert section.type == "section"
+    last = section.blocks[-1] if section.blocks else None
+    if last is not None and last.type == "section":
+        lead = next(_ids([last.title or []], source), None)
+        reopened = lead in heads and not any(child.type == "section" for child in last.blocks)
+        if not reopened:
+            deeper = _append_deep(last, extra, heads, source)
+            return section.model_copy(update={"blocks": [*section.blocks[:-1], deeper]})
+    return section.model_copy(update={"blocks": [*section.blocks, *extra]})
+
+
+def _compact(ids: list[int]) -> list[str]:
+    runs: list[list[int]] = []
+    for number in ids:
+        if runs and runs[-1][-1] == number - 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    return [str(run[0]) if len(run) == 1 else f"{run[0]}-{run[-1]}" for run in runs]
 
 
 def _mark_headings(by_page: dict[int, list[Segment]]) -> list[list[int]]:
@@ -1089,44 +1319,66 @@ def _question_section(head: Segment, body: list[Segment]) -> BlockPlan:
 def _name_untitled_questions(
     blocks: list[BlockPlan], headings: set[int], source: dict[int, Segment], claimed: set[int]
 ) -> list[BlockPlan]:
-    """번호와 글자 모양이 이어지는 다음 문항이 있을 때만 이미 묶인 답의 제목을 분리한다.
+    """제목 없는 섹션이 문항 제목 줄로 시작하면 그 줄을 제목으로 떼고, 다음 문항 앞까지의 형제 블록을 안에 넣는다.
 
-    묶음은 이 문항 첫 줄부터 다음 문항 제목 앞까지의 조각만 가져야 한다. 그 범위에서 묶음이 갖지 않은 조각은
-    계획 어디에도 없어야 한다. 그런 조각은 조립 때 바로 앞 조각 뒤에 되살아나므로 같은 문항 안에 남는다.
+    문항 제목은 번호가 하나씩 이어지고 글자 모양과 왼쪽 끝이 같은 앞뒤 문항이 있어야 한다. 문항 범위(이 문항 첫 줄부터
+    다음 문항 제목 앞까지, 마지막 문항은 가진 조각 끝까지)에서 섹션과 넣을 형제가 갖지 않은 조각은 계획 어디에도
+    없어야 한다. 그런 조각은 조립 때 바로 앞 조각 뒤에 되살아나므로 같은 문항 안에 남는다. 마지막 문항은 뒤따르는
+    형제 섹션만 넣는다(뒤의 맺음말 문단은 문항 밖에 둔다).
     """
-    result = list(blocks)
-    for index, (block, following) in enumerate(pairwise(blocks)):
-        if block.type != "section" or block.title or not block.blocks or following.type != "section":
+    ordered = sorted(headings)
+    result: list[BlockPlan] = []
+    index = 0
+    while index < len(blocks):
+        block = blocks[index]
+        index += 1
+        if block.type != "section" or block.title or not block.blocks:
+            result.append(block)
             continue
         first = block.blocks[0]
-        if first.type != "paragraph" or first.keep_lines:
-            continue
-        start = next(_ids([first.segments], source), None)
-        next_title = list(_ids([following.title or []], source))
-        if start not in headings or len(next_title) != 1 or next_title[0] not in headings:
+        start = next(_ids([first.segments], source), None) if first.type == "paragraph" else None
+        if first.type != "paragraph" or first.keep_lines or start not in headings:
+            result.append(block)
             continue
         assert start is not None
-        end = next_title[0]
-        head, other = source[start], source[end]
-        a, b = (_NUMBERED.fullmatch(s.text.strip()) for s in (head, other))
-        owned = set(_ids(_block_refs(block), source))
-        scope = set(range(start, end))
-        if (
-            a is None
-            or b is None
-            or int(b[1]) - int(a[1]) != 1
-            or abs(head.x - other.x) >= 4
-            or (head.size, head.color) != (other.size, other.color)
-            or not owned <= scope
-            or (scope - owned) & claimed
-        ):
+        position = ordered.index(start)
+        neighbour = ordered[position + 1] if position + 1 < len(ordered) else None
+        series = neighbour if neighbour is not None else (ordered[position - 1] if position else None)
+        if series is None or not _same_series(source[start], source[series], after=neighbour is not None):
+            result.append(block)
+            continue
+        taken: list[BlockPlan] = []
+        while index + len(taken) < len(blocks):
+            candidate = blocks[index + len(taken)]
+            ids = list(_ids(_block_refs(candidate), source))
+            inside = bool(ids) and min(ids) > start and (neighbour is None or max(ids) < neighbour)
+            if not inside or (neighbour is None and candidate.type != "section"):
+                break
+            taken.append(candidate)
+        owned = set(_ids(_block_refs(block), source)).union(*(set(_ids(_block_refs(b), source)) for b in taken))
+        scope = set(range(start, neighbour if neighbour is not None else max(owned) + 1))
+        if not owned <= scope or (scope - owned) & claimed:
+            result.append(block)
             continue
         before, after = _split_refs(first.segments, {start}, source)
         if before:
+            result.append(block)
             continue
         body = [first.model_copy(update={"segments": after})] if after else []
-        result[index] = block.model_copy(update={"title": [str(start)], "blocks": [*body, *block.blocks[1:]]})
+        # 문항 안으로 넣는 제목 없는 섹션은 쪽 경계에서 모델이 연 묶음일 뿐이라 풀어서 넣는다.
+        inner = [child for b in taken for child in (b.blocks if b.type == "section" and not b.title else [b])]
+        result.append(block.model_copy(update={"title": [str(start)], "blocks": [*body, *block.blocks[1:], *inner]}))
+        index += len(taken)
     return result
+
+
+def _same_series(head: Segment, other: Segment, *, after: bool) -> bool:
+    """두 문항 제목이 번호가 하나 차이로 이어지고 글자 모양과 왼쪽 끝이 같은가. after면 other가 다음 문항이다."""
+    a, b = (_NUMBERED.fullmatch(s.text.strip()) for s in (head, other))
+    if a is None or b is None:
+        return False
+    step = int(b[1]) - int(a[1]) if after else int(a[1]) - int(b[1])
+    return step == 1 and abs(head.x - other.x) < 4 and (head.size, head.color) == (other.size, other.color)
 
 
 def _recover_questions(
