@@ -157,6 +157,22 @@ def test_consecutive_lines_led_by_the_same_mark_are_list_items_not_headings() ->
     assert revise_structure(plan, segments, request) == plan
 
 
+def test_marked_titles_over_indented_form_cells_are_heading_lines() -> None:
+    # 양식 이력서: "• 학력사항" 아래 내용이 들여 쓴 표 칸이다. 같은 단에 바로 아래 줄이 없어도 제목 줄이다.
+    spans = [
+        _span("• 인적사항", 43, 128, 87, size=10.5),
+        _span("성명", 185, 154, 214, size=9.5), _span("신효정", 248, 154, 274, size=9.5),
+        _span("• 학력사항", 43, 302, 87, size=10.5),
+        _span("기간", 92, 327, 120, size=9.5), _span("학교명", 263, 327, 312, size=9.5),
+        _span("• 경력사항", 43, 468, 87, size=10.5),
+        _span("2024.08 - 현재", 79, 520, 138, size=9.5), _span("해담건축사사무소", 241, 520, 310, size=9.5),
+    ]  # fmt: skip
+    request, segments = _request(_page(1, spans), kind=DocumentType.RESUME)
+    plan = _plan(_s(None, _p("1"), _p("2-3")), _s(None, _p("4"), _p("5-6")), _s(None, _p("7"), _p("8-9")))
+    revised = revise_structure(plan, segments, request)
+    assert _shape(revised.blocks) == [(["1"], [["2-3"]]), (["4"], [["5-6"]]), (["7"], [["8-9"]])]
+
+
 def _page_break_letter(*, last_line_end: float = 530) -> list[PdfPage]:
     """쪽이 바뀌며 문단이 이어지는 자기소개서.
 

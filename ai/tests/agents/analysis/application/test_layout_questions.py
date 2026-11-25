@@ -86,3 +86,29 @@ def test_an_untitled_section_inside_a_question_is_unwrapped() -> None:
     """쪽 경계에서 모델이 제목 없이 연 섹션이 문항 범위 안이면 그 내용을 문항에 바로 넣는다."""
     shaped = _revise(_LINES, _s(None, _p("1-4")), _s(None, _p("5-6")), _s(None, _p("7")), _s(["8"], _p("9")))
     assert shaped[1] == (["5"], [(["6"], [["7"]]), (["8"], [["9"]])])
+
+
+def test_a_long_sentence_used_as_a_section_title_goes_back_to_the_text() -> None:
+    lines = [
+        ("제가 기획한 두 프로젝트를 소개드립니다. 정책서와 화면 설계서는 첨부한 포트폴리오에 담았습니다.", 10.0),
+        (_BODY, 10.0),
+        ("[경력]", 10.0),
+        ("※ 건축 설계 분야의 정규직 경력은 없고, 이전 직무는 게임 그래픽과 레벨 디자인이었습니다.", 10.0),
+        (_BODY, 10.0),
+    ]
+    shaped = _revise(lines, _s(["1"], _p("2")), _s(["3", "4"], _p("5")))
+    assert shaped == [["1"], ["2"], (["3"], [["4"], ["5"]])]
+
+
+def test_a_body_line_cut_mid_sentence_used_as_a_title_goes_back_to_the_text() -> None:
+    line = (
+        "블로그 주소는 이력서에 적어 두었습니다. "
+        "업무와 직접 관련된 내용은 아니지만 꾸준히 운영해 온 기록이라 보여 드릴 수 있"
+    )
+    shaped = _revise([(_BODY, 10.0), (line, 10.0), ("는 자료입니다.", 10.0)], _p("1"), _s(["2"], _p("3")))
+    assert shaped == [["1"], ["2"], ["3"]]
+
+
+def test_a_title_without_letters_or_digits_goes_back_to_the_text() -> None:
+    shaped = _revise([(_BODY, 10.0), ("/**", 10.0), (" * 매일 실행하는 작업", 10.0)], _p("1"), _s(["2"], _p("3")))
+    assert shaped == [["1"], ["2"], ["3"]]

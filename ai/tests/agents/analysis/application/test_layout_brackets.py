@@ -156,3 +156,11 @@ def test_a_section_the_model_opened_after_a_finished_paragraph_stays_apart() -> 
     pages = [["1. 지원 동기", _BODY, "짧게 끝난 줄."], [_BODY, _BODY]]
     shaped = _revise_pages(pages, _s(["1"], _p("2-3")), _s(None, _p("4"), _p("5")))
     assert shaped == [(["1"], [["2-3"]]), (None, [["4"], ["5"]])]
+
+
+def test_a_page_end_line_wrapped_short_of_the_edge_mid_sentence_still_continues() -> None:
+    """낱말 단위 줄바꿈으로 쪽 끝 줄이 단 끝보다 글자 서너 개 짧아도, 문장 끝 부호가 없으면 다음 쪽으로 이어진다."""
+    wrapped = _BODY[:20]  # 단 끝(25글자)보다 다섯 글자 짧다
+    pages = [["1. 지원 동기", "〈처음 만난 문제〉", _BODY, wrapped], [_BODY, "〈해결한 방법〉", _BODY]]
+    shaped = _revise_pages(pages, _s(["1"], _p("2"), _p("3-4")), _s(None, _p("5"), _p("6"), _p("7")))
+    assert shaped == [(["1"], [(["2"], [["3-4"], ["5"]]), (["6"], [["7"]])])]

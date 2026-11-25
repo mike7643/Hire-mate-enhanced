@@ -62,6 +62,8 @@ _MAX_MISSING_RATIO = 0.5
 # 쪽 안에서 모델이 이만큼 넘게 연달아 빠뜨린 조각은 그 구간만 다시 묻는다(대개 답을 중간에 멈춘 경우). 더 짧은 구간은
 # 조립이 읽는 자리에 문단으로 되살린다.
 _RETRY_RUN = 8
+# 옆 칸 이름표로 보는 제목 한 줄의 최대 글자 수(공백 뺌).
+_SIDE_LABEL_CHARS = 12
 # 조각 번호는 ASCII이며, 로컬 JSON 문법 생성기에서 \d 대신 명시적 범위를 쓴다.
 _REF = r"^[0-9]+(-[0-9]+)?$"
 _BRACKET_HEADING = re.compile(r"\[([^\[\]\n]{1,80})\]")
@@ -1011,17 +1013,45 @@ class _Builder:
         return {"ids": self.take(plan.segments), "items": [self._item(child) for child in plan.items]}
 
     def _single_title(self, title: list[int]) -> tuple[list[int], list[int]]:
-        """section 제목이 세 줄 이상이면 본문이 섞인 것으로 보고 첫 줄만 제목으로 남긴다."""
+        """section 제목이 세 줄 이상이면 본문이 섞인 것으로 보고 첫 줄만 제목으로 남긴다.
+
+        칸 표 양식의 항목 이름("성 격 의 / 장 단 점 / 및 특 기")은 예외다. 짧은 줄을 쌓았고 같은 높이 오른쪽에 제목이
+        아닌 글(본문 칸)이 있으면 옆 칸 이름표라 그대로 둔다.
+        """
         lines: list[tuple[int, float]] = []
         for segment in self.segments(title):
             key = (segment.page, segment.y)
             if not any(page == key[0] and abs(y - key[1]) < _SAME_LINE for page, y in lines):
                 lines.append(key)
-        if len(lines) < 3:
+        if len(lines) < 3 or self._side_label(title):
             return title, []
         page, y = lines[0]
         head = [n for n in title if self._segments[n].page == page and abs(self._segments[n].y - y) < _SAME_LINE]
         return head, [n for n in title if n not in head]
+
+    def _side_label(self, title: list[int]) -> bool:
+        """옆 칸 이름표인가.
+
+        짧은 줄(줄마다 12자 이하)을 쌓았고, 같은 높이 오른쪽에 제목이 아닌 글이 있으며,
+        이름이 모두 그 글보다 왼쪽에 있다.
+        """
+        members = set(title)
+        segments = self.segments(title)
+        if not segments or len({s.page for s in segments}) != 1:
+            return False
+        if any(len(_compact(s.text)) > _SIDE_LABEL_CHARS for s in segments):
+            return False
+        page = self._by_page.get(segments[0].page, [])
+        right_edge = max(s.end_x for s in segments)
+        beside = [
+            other
+            for segment in segments
+            for other in page
+            if other.id not in members
+            and abs(other.y - segment.y) <= 0.6 * (segment.size or 10.0)
+            and other.x > segment.end_x
+        ]
+        return bool(beside) and right_edge < min(other.x for other in beside)
 
     def restore_grids(self, blocks: list[Node], pages: list[PdfPage]) -> None:
         for page in pages:

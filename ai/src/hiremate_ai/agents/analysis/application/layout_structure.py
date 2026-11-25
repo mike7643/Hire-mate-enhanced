@@ -62,8 +62,14 @@ _MARK_HEADING_CHARS = 30
 # 같은 줄로 보는 세로 차이와, 같은 단으로 보는 들여쓰기 한도(pt).
 _SAME_LINE_GAP = 1.0
 _HEADING_INDENT = 24.0
-# 단 너비에 대한 비율. 줄 끝이 단 오른쪽 끝에서 이만큼 안이면 줄이 끝까지 찼다고(문단이 이어진다고) 본다.
-_FULL_LINE = 0.08
+# 같은 기호 줄이 글자 크기의 이 배수 안에서 위아래로 붙어 있으면 목록 항목으로 본다(줄 간격 1.2~2배).
+_LIST_GAP = 2.5
+# 쪽 끝 줄이 단 너비의 이 비율을 넘고 문장 끝 부호 없이 끝나면 문단이 다음 쪽으로 이어진다고 본다.
+_OPEN_LINE = 0.75
+_SENTENCE_END = frozenset(".!?。")
+# 섹션 제목이 이보다 길고(공백 뺀 글자 수) 문장 끝 부호로 끝나면 제목이 아니라 문장으로 본다.
+_PROSE_TITLE_CHARS = 40
+_SENTENCE_BREAK = re.compile(r"[.!?。]\s+\S")
 # 시각 자료 안내는 모델 문장 대신 종류별로 고정한 문장만 쓴다.
 _NOTICE_TEXT = {
     "image": "원본 PDF {pages}쪽에 이미지가 있습니다. 내용은 원본에서 확인해 주세요.",
@@ -116,6 +122,7 @@ def revise_structure(
         blocks = _apply_bullets(blocks, items, source)
     title, blocks = _document_title(plan.title, blocks, segments, groups, source)
     blocks = _title_untitled_sections(blocks, groups, source)
+    blocks = _demote_prose_titles(blocks, source)
     brackets = {group[0] for group in _bracket_headings(by_page)}
     used = set(_ids(_plan_refs(title, blocks), source))
     blocks = _join_page_continuations(blocks, set(groups) - brackets, brackets, used, source, by_page)
@@ -641,6 +648,42 @@ def _bracket_sections(blocks: list[BlockPlan], heads: set[int], source: dict[int
     return result
 
 
+def _demote_prose_titles(blocks: list[BlockPlan], source: dict[int, Segment]) -> list[BlockPlan]:
+    """문장으로 쓴 긴 섹션 제목(공백 빼고 40자 넘고, 문장 끝 부호로 끝나거나 중간에 문장이 끝나는)은 본문이다.
+
+    모델이 쪽 묶음 첫 줄이나 안내 문장을 제목으로 쓴 경우다. 글자나 숫자가 하나도 없는 제목(코드 주석 \"/**\" 같은)도
+    본문으로 돌린다. 제목 앞머리에 짧은 이름 조각(\"[경력]\" 같은)이 따로 있으면
+    그 조각만 제목으로 남기고 나머지를 첫 문단으로 내린다. 이름 조각이 없으면 섹션을 풀어 제목 줄을 문단으로 두고
+    내용은 그 뒤에 그대로 잇는다.
+    """
+    from hiremate_ai.agents.analysis.application.normalize import ParagraphPlan
+
+    result: list[BlockPlan] = []
+    for block in blocks:
+        if block.type != "section":
+            result.append(block)
+            continue
+        children = _demote_prose_titles(block.blocks, source)
+        ids = list(_ids([block.title or []], source))
+        text = " ".join(source[n].text.strip() for n in ids)
+        compact = "".join(text.split())
+        symbolic = bool(compact) and not any(char.isalnum() for char in compact)
+        prose = len(compact) > _PROSE_TITLE_CHARS and (
+            compact[-1:] in _SENTENCE_END or _SENTENCE_BREAK.search(text) is not None
+        )
+        if not (symbolic or prose):
+            result.append(block if children == block.blocks else block.model_copy(update={"blocks": children}))
+            continue
+        head = ids[0]
+        name = "".join(source[head].text.split())
+        if len(ids) > 1 and 0 < len(name) <= _LABEL_CHARS and name[-1:] not in _SENTENCE_END:
+            lead = ParagraphPlan(type="paragraph", segments=_compact(ids[1:]))
+            result.append(block.model_copy(update={"title": [str(head)], "blocks": [lead, *children]}))
+            continue
+        result.extend([ParagraphPlan(type="paragraph", segments=_compact(ids)), *children])
+    return result
+
+
 def _join_page_continuations(
     blocks: list[BlockPlan],
     headings: set[int],
@@ -655,7 +698,7 @@ def _join_page_continuations(
     줄이 단 오른쪽 끝까지 차 있고(문단이 끝나지 않았고) 제목 없는 섹션이 다음 쪽의 바로 다음 조각에서 시작하면, 그
     앞부분은 앞 섹션 글이다. 옮기는 범위는 처음 나오는 섹션이나 제목 후보 줄 앞까지다. 괄호 소제목 줄은 함께 옮겨
     소제목 규칙이 그 자리에서 세우게 한다. 앞 섹션 안에서는 맨 끝 섹션을 따라 내려가되 괄호 소제목 섹션 앞에서
-    멈춘다(그 섹션은 소제목 규칙이 형제로 다시 세운다).
+    멈춘다(그 섹션은 소제목 규칙이 형제로 다시 세운다). 잇는 증거는 _continues에 있다.
     """
     result: list[BlockPlan] = []
     for block in blocks:
@@ -688,7 +731,11 @@ def _continues(
     source: dict[int, Segment],
     by_page: dict[int, list[Segment]],
 ) -> bool:
-    """block이 다음 쪽에서 previous의 마지막 문단을 잇는가. 사이 조각은 계획이 쓰지 않은 것(쪽 번호 같은)만 있다."""
+    """block이 다음 쪽에서 previous의 마지막 줄을 잇는가.
+
+    두 줄의 글자 크기, 색, 왼쪽 끝이 같고, 앞 줄이 그 단의 오른쪽 끝(글자 세 개 안)까지 차 있거나 단 너비의 3/4을
+    넘고 문장 끝 부호 없이 끝난다. 사이 조각은 계획이 쓰지 않은 것(쪽 번호 같은)만 있다.
+    """
     last_id = max(_ids(_block_refs(previous), source), default=None)
     first_id = min(_ids(_block_refs(block), source), default=None)
     if last_id is None or first_id is None or first_id <= last_id:
@@ -696,15 +743,17 @@ def _continues(
     if any(n in used for n in range(last_id + 1, first_id)):
         return False
     last, first = source[last_id], source[first_id]
-    if first.page <= last.page:
+    if first.page <= last.page or last.size is None:
         return False
-    page = by_page.get(last.page, [])
-    column = [s for s in page if abs(s.x - last.x) <= _HEADING_INDENT and s.x < s.end_x]
-    line_end = max(s.end_x for s in page if s.page == last.page and abs(s.y - last.y) <= _SAME_LINE_GAP)
-    if not column:
+    if (last.size, last.color) != (first.size, first.color) or abs(last.x - first.x) > 2:
         return False
-    left, right = min(s.x for s in column), max(s.end_x for s in column)
-    return right - left > 0 and line_end >= right - _FULL_LINE * (right - left)
+    edge = max(s.end_x for s in by_page.get(last.page, []) if round(s.x) == round(last.x))
+    line = sorted((s for s in by_page[last.page] if abs(s.y - last.y) <= _SAME_LINE_GAP), key=lambda s: s.x)
+    line_end = line[-1].end_x
+    if line_end >= edge - 3 * last.size:
+        return True
+    # 낱말 단위 줄바꿈은 줄 끝을 글자 서너 개만큼 남긴다. 줄이 단 너비의 3/4을 넘고 문장 끝 부호로 끝나지 않으면 잇는다.
+    return line_end >= last.x + _OPEN_LINE * (edge - last.x) and line[-1].text.rstrip()[-1:] not in _SENTENCE_END
 
 
 def _append_deep(section: BlockPlan, extra: list[BlockPlan], heads: set[int], source: dict[int, Segment]) -> BlockPlan:
@@ -733,8 +782,10 @@ def _compact(ids: list[int]) -> list[str]:
 def _mark_headings(by_page: dict[int, list[Segment]]) -> list[list[int]]:
     """같은 기호로 시작하는 짧은 한 줄이 같은 들여쓰기로 두 번 이상 본문 앞에 나오면 제목 줄로 본다.
 
-    "■ 성장과정"처럼 본문보다 글자가 작아 글자 모양으로는 찾지 못하는 제목이다. 바로 위나 아래 줄도 같은 기호로
-    시작하면 목록 항목이라 뺀다. 아래에 이어지는 줄이 없으면 제목으로 보지 않는다.
+    "■ 성장과정"처럼 본문보다 글자가 작아 글자 모양으로는 찾지 못하는 제목이다. 같은 단에서 줄 간격 안에 붙은 위나
+    아래 줄도 같은 기호로 시작하면 목록 항목이라 뺀다. 바로 아래 줄이 없거나 제목보다 왼쪽에서
+    시작하면(아래에 딸린 내용이 아니면) 제목으로 보지 않는다. 양식 이력서처럼 제목 아래 내용이 표 칸으로 들여 쓰여
+    있어도 그 표가 제목에 딸린 내용이다.
     """
     found: list[tuple[str, Segment]] = []
     for segments in by_page.values():
@@ -748,7 +799,15 @@ def _mark_headings(by_page: dict[int, list[Segment]]) -> list[list[int]]:
                 continue
             above = _column_neighbour(reversed(lines[:index]), line)
             below = _column_neighbour(iter(lines[index + 1 :]), line)
-            if below is None or any(n is not None and n.text.strip()[:1] == mark for n in (above, below)):
+            after = _next_line(iter(lines[index + 1 :]), line)
+            if after is None or after.x < line.x - 2:
+                continue
+            # 목록 항목은 같은 기호 줄이 줄 간격 안에 붙어 있다. 사이에 다른 내용(표 칸)이 있으면 목록이 아니다.
+            gap = _LIST_GAP * (line.size or 10.0)
+            if any(
+                n is not None and n.text.strip()[:1] == mark and abs(n.x - line.x) <= 2 and abs(n.y - line.y) <= gap
+                for n in (above, below)
+            ):
                 continue
             found.append((mark, line))
     return [
@@ -756,6 +815,11 @@ def _mark_headings(by_page: dict[int, list[Segment]]) -> list[list[int]]:
         for mark, line in found
         if sum(1 for other_mark, other in found if other_mark == mark and abs(other.x - line.x) <= 2) >= 2
     ]
+
+
+def _next_line(lines: Iterator[Segment], line: Segment) -> Segment | None:
+    """읽는 순서로 줄이 바뀐 가장 가까운 줄(단과 상관없이)."""
+    return next((other for other in lines if abs(other.y - line.y) >= _SAME_LINE_GAP), None)
 
 
 def _column_neighbour(lines: Iterator[Segment], line: Segment) -> Segment | None:
@@ -970,20 +1034,79 @@ def _as_items(block: BlockPlan, source: dict[int, Segment]) -> list[ItemPlan]:
 def _repair_forms(
     plan: DocumentPlan, pages: list[PdfPage], by_page: dict[int, list[Segment]], source: dict[int, Segment]
 ) -> list[BlockPlan]:
-    protected: set[int] | None = None
+    # 문서 제목이나 목록, 잡음과 충돌하는 위치는 모델 구조를 그대로 둔다.
+    protected = set(_ids([plan.title or [], *_protected_refs(plan.blocks)], source))
     blocks = plan.blocks
-    for page in pages:
-        forms = _forms(page, by_page.get(page.number, []))
-        if len(forms) < 3:
-            continue
-        if protected is None:
-            # 문서 제목이나 목록, 잡음과 충돌하는 위치는 모델 구조를 그대로 둔다.
-            protected = set(_ids([plan.title or [], *_protected_refs(plan.blocks)], source))
+    found = [forms for page in pages if len(forms := _forms(page, by_page.get(page.number, []))) >= 3]
+    if not found:
+        spanning = _spanning_forms(pages, by_page)
+        found = [spanning] if len(spanning) >= 2 else []
+    for forms in found:
         for label, body in forms:
             target = {s.id for s in (*label, *body)}
             if not target & protected:
                 blocks = _splice(blocks, _form_section(label, body), target, source)
     return blocks
+
+
+def _spanning_forms(pages: list[PdfPage], by_page: dict[int, list[Segment]]) -> list[_Form]:
+    """칸 표 양식: 세로선이 왼쪽 좁은 항목 칸과 본문 칸을 나누고, 가로선이 항목을 나눈다. 본문 칸은 쪽을 넘을 수 있다.
+
+    쪽마다 표 틀(왼쪽 테두리, 항목 칸 경계, 오른쪽 테두리 세로선)을 찾아 가로선으로 칸을 자른다. 위쪽 가로선 없이 쪽
+    맨 위에서 시작한 첫 칸에 항목 이름이 없으면 앞 쪽 칸의 본문이 이어진 것이다. 항목 이름은 짧고(합쳐 30자 이하)
+    본문은 세 줄 넘는 글이어야 한다. 칸을 가로지르는 조각이 있는 쪽은 쓰지 않는다.
+    """
+    forms: list[tuple[list[Segment], list[Segment]]] = []
+    for page in pages:
+        frame = _label_frame(page)
+        if frame is None:
+            continue
+        left, divider, right, top, bottom, cuts = frame
+        lines = sorted((s for s in by_page.get(page.number, []) if s.x < s.end_x), key=lambda s: (s.y, s.x))
+        inside = [s for s in lines if top < s.y < bottom and left - 1 <= s.x and s.end_x <= right + 1]
+        if any(s.x < divider - 1 and s.end_x > divider + 1 for s in inside):
+            continue
+        bounds = [top, *(y for y in cuts if top + 2 < y < bottom - 2), bottom]
+        for index, (upper, lower) in enumerate(pairwise(bounds)):
+            cell = [s for s in inside if upper < s.y < lower]
+            label = [s for s in cell if s.end_x <= divider + 1]
+            body = [s for s in cell if s.x >= divider - 1]
+            if label:
+                forms.append((label, body))
+            elif index == 0 and not any(abs(y - top) <= 2 for y in cuts) and forms and body:
+                forms[-1][1].extend(body)
+    return [
+        (label, body)
+        for label, body in forms
+        if sum(len(s.text.strip()) for s in label) <= 30
+        and any(char.isalpha() for s in label for char in s.text)
+        and len(body) >= 3
+        and median(len(s.text) for s in body) >= 25
+    ]
+
+
+def _label_frame(page: PdfPage) -> tuple[float, float, float, float, float, list[float]] | None:
+    """쪽의 칸 표 틀: (왼쪽 테두리, 항목 칸 경계, 오른쪽 테두리, 위, 아래, 가로선 y 목록). 없으면 None."""
+    layout = page.layout
+    if layout is None:
+        return None
+    for evidence, thickness in ((layout.fill_rects, 1.6), (page.grid_lines, 0.0)):
+        across, down = _rules(evidence, thickness)
+        columns: dict[int, list[float]] = {}
+        for start, end, x in down:
+            key = next((k for k in columns if abs(k - x) <= 1.5), round(x))
+            extent = columns.setdefault(key, [start, end])
+            extent[0], extent[1] = min(extent[0], start), max(extent[1], end)
+        tall = sorted((x, a, b) for x, (a, b) in columns.items() if b - a >= layout.height * 0.2)
+        if len(tall) < 3:
+            continue
+        (left, top, bottom), (right, _, _) = tall[0], tall[-1]
+        dividers = [x for x, a, b in tall[1:-1] if 0.07 < (x - left) / (right - left) < 0.18]
+        if right - left < layout.width * 0.7 or len(dividers) != 1:
+            continue
+        cuts = sorted(y for a, b, y in across if a <= left + 2 and b >= right - 2)
+        return left, dividers[0], right, top, bottom, cuts
+    return None
 
 
 def ensure_visual_notices(
