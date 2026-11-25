@@ -121,6 +121,7 @@ def revise_structure(
     if items:
         blocks = _apply_bullets(blocks, items, source)
     title, blocks = _document_title(plan.title, blocks, segments, groups, source)
+    blocks = _fill_empty_sections(_hoist_untitled_tails(blocks))
     blocks = _title_untitled_sections(blocks, groups, source)
     blocks = _demote_prose_titles(blocks, source)
     brackets = {group[0] for group in _bracket_headings(by_page)}
@@ -128,10 +129,103 @@ def revise_structure(
     blocks = _join_page_continuations(blocks, set(groups) - brackets, brackets, used, source, by_page)
     if brackets:
         blocks = _bracket_sections(blocks, brackets, source)
-    blocks = refine_outline(blocks, source, request.pages)
+    blocks = _merge_duplicate_notices(refine_outline(blocks, source, request.pages))
     if title == original.title and blocks == original.blocks:
         return original
     return original.model_copy(update={"title": title, "blocks": blocks})
+
+
+def _hoist_untitled_tails(blocks: list[BlockPlan]) -> list[BlockPlan]:
+    """제목 없는 섹션의 마지막 자식이 또 제목 없는 섹션이면 형제로 꺼낸다.
+
+    모델이 다음 항목(프로젝트, 문항)을 앞 항목 안에 줄줄이 겹쳐 넣은 경우다. 제목 없는 묶음 안의 제목 없는 묶음은 소속
+    정보가 없어 꺼내도 잃는 것이 없고, 읽는 순서도 그대로다.
+    """
+    result: list[BlockPlan] = []
+    for block in blocks:
+        if block.type != "section":
+            result.append(block)
+            continue
+        children = _hoist_untitled_tails(block.blocks)
+        tail: list[BlockPlan] = []
+        while not block.title and len(children) > 1 and children[-1].type == "section" and not children[-1].title:
+            last = children.pop()
+            assert last.type == "section"
+            tail = [last.model_copy(update={"blocks": _hoist_untitled_tails(last.blocks)}), *tail]
+        result.append(block if children == block.blocks else block.model_copy(update={"blocks": children}))
+        result.extend(_hoist_untitled_tails(tail) if tail else [])
+    return result
+
+
+def _fill_empty_sections(blocks: list[BlockPlan]) -> list[BlockPlan]:
+    """내용 없는 제목 섹션 바로 뒤에 제목 없는 섹션이 오면 그 내용을 제목 섹션에 넣는다.
+
+    모델이 제목과 내용을 따로 묶은 경우다(제목은 한 섹션, 내용은 바로 뒤 제목 없는 섹션). 순서는 그대로다.
+    """
+    result: list[BlockPlan] = []
+    for block in blocks:
+        if block.type == "section":
+            children = _fill_empty_sections(block.blocks)
+            if children != block.blocks:
+                block = block.model_copy(update={"blocks": children})
+        previous = result[-1] if result else None
+        if (
+            block.type == "section"
+            and not block.title
+            and block.blocks
+            and previous is not None
+            and previous.type == "section"
+            and previous.title
+            and not previous.blocks
+        ):
+            result[-1] = previous.model_copy(update={"blocks": block.blocks})
+            continue
+        result.append(block)
+    return result
+
+
+def _merge_duplicate_notices(blocks: list[BlockPlan]) -> list[BlockPlan]:
+    """같은 쪽을 가리키는 원본 확인 안내는 처음 것 하나만 둔다. 뒤의 것이 종류를 알면 그 종류를 쓴다.
+
+    안내는 원문이 아니라 코드가 붙이는 문구라 줄여도 원문 보존과 상관없다. 쪽 묶음마다 모델이 같은 쪽 안내를 다시
+    넣거나, 같은 쪽에 '시각 자료'와 '이미지' 안내를 함께 넣는 경우다.
+    """
+    from hiremate_ai.agents.analysis.application.normalize import VisualNoticePlan
+
+    notices: dict[tuple[int, ...], VisualNoticePlan] = {}
+
+    def gather(entries: list[BlockPlan]) -> None:
+        for block in entries:
+            if block.type == "section":
+                gather(block.blocks)
+            elif block.type == "visual_notice":
+                key = tuple(sorted(set(block.pages)))
+                kept = notices.setdefault(key, block)
+                if kept.visual_type == "unknown" and block.visual_type != "unknown":
+                    notices[key] = kept.model_copy(
+                        update={
+                            "visual_type": block.visual_type,
+                            "message": visual_notice_message(block.visual_type, list(key)),
+                        }
+                    )
+
+    def rebuild(entries: list[BlockPlan], placed: set[tuple[int, ...]]) -> list[BlockPlan]:
+        result: list[BlockPlan] = []
+        for block in entries:
+            if block.type == "section":
+                children = rebuild(block.blocks, placed)
+                result.append(block if children == block.blocks else block.model_copy(update={"blocks": children}))
+            elif block.type == "visual_notice":
+                key = tuple(sorted(set(block.pages)))
+                if key not in placed:
+                    placed.add(key)
+                    result.append(notices[key])
+            else:
+                result.append(block)
+        return result
+
+    gather(blocks)
+    return rebuild(blocks, set())
 
 
 def _release_stray_cells(
@@ -836,7 +930,8 @@ def _title_untitled_sections(
     """모델이 제목 없이 나눈 섹션이 글자 모양으로 찾은 제목 후보 줄로 시작하면 그 줄을 섹션 제목으로 올린다.
 
     같은 줄 오른쪽에 붙은 조각(기간 같은)은 제목에 함께 넣는다. 모델이 단 제목, 섹션 밖의 문단, 줄을 지키라는
-    문단은 건드리지 않는다. 제목을 빼고 남는 내용이 없으면 그대로 둔다.
+    문단은 건드리지 않는다. 제목을 빼고 남는 내용이 없으면 그대로 둔다. 제목 후보가 아니어도 첫 줄이 섹션의 나머지
+    글보다 큰 글자(0.35pt 이상)의 짧은 한 줄이면 제목으로 본다(양식 이력서의 "학력사항" 같은 칸 위 제목).
     """
     from hiremate_ai.agents.analysis.application.normalize import ParagraphPlan
 
@@ -850,6 +945,8 @@ def _title_untitled_sections(
         if not block.title and first is not None and first.type == "paragraph" and not first.keep_lines:
             ids = list(_ids([first.segments], source))
             group = groups.get(ids[0]) if ids else None
+            if group is None and ids and _larger_lead_line(ids, children[1:], source):
+                group = [n for n in ids if _same_line(source[n], source[ids[0]])]
             if group is not None and ids[: len(group)] == group:
                 end = len(group)
                 last = source[group[-1]]
@@ -863,6 +960,28 @@ def _title_untitled_sections(
                     continue
         result.append(block if children == block.blocks else block.model_copy(update={"blocks": children}))
     return result
+
+
+def _larger_lead_line(ids: list[int], rest: list[BlockPlan], source: dict[int, Segment]) -> bool:
+    lead = [source[n] for n in ids if _same_line(source[n], source[ids[0]])]
+    if ids[: len(lead)] != [s.id for s in lead]:
+        return False
+    text = "".join("".join(s.text.split()) for s in lead)
+    if not 0 < len(text) <= _LABEL_CHARS * 2 or text[-1:] in _SENTENCE_END or not any(c.isalpha() for c in text):
+        return False
+    # 번호 붙은 문항 제목("1. 지원동기")은 앞뒤 문항 근거를 보는 문항 규칙에만 맡긴다.
+    if _NUMBERED.fullmatch(" ".join(s.text.strip() for s in lead)):
+        return False
+    body = [source[n] for n in ids[len(lead) :]] + [source[n] for n in _ids(_plan_refs(None, rest), source)]
+    sizes = [s.size for s in body if s.size and s.x < s.end_x]
+    head = [s.size for s in lead if s.size]
+    if len(sizes) < 2 or not head:
+        return False
+    return min(head) >= median(sizes) + 0.35 and lead[0].x <= min(s.x for s in body) + 1
+
+
+def _same_line(segment: Segment, other: Segment) -> bool:
+    return segment.page == other.page and abs(segment.y - other.y) < 1.5
 
 
 def _same_line_right(segment: Segment, previous: Segment) -> bool:
@@ -1495,6 +1614,39 @@ def _name_untitled_questions(
     return result
 
 
+def _unnest_questions(blocks: list[BlockPlan], headings: set[int], source: dict[int, Segment]) -> list[BlockPlan]:
+    """모델이 다음 문항을 앞 문항 섹션 안에 겹쳐 넣었으면(제목 없는 섹션이 줄줄이 안으로 들어감) 형제로 꺼낸다.
+
+    문항 제목 줄로 시작하는 제목 없는 섹션 안에서, 다른 문항 제목 줄로 시작하는 제목 없는 섹션을 만나면 그 섹션과 그
+    뒤의 블록을 바깥 형제로 옮긴다. 읽는 순서는 그대로다.
+    """
+    result: list[BlockPlan] = []
+    for block in blocks:
+        result.extend(_lift_question(block, headings, source))
+    return result
+
+
+def _lift_question(block: BlockPlan, headings: set[int], source: dict[int, Segment]) -> list[BlockPlan]:
+    if not _opens_question(block, headings, source) or block.type != "section":
+        return [block]
+    children = block.blocks
+    for index in range(1, len(children)):
+        if _opens_question(children[index], headings, source):
+            return [
+                block.model_copy(update={"blocks": children[:index]}),
+                *_lift_question(children[index], headings, source),
+                *_unnest_questions(children[index + 1 :], headings, source),
+            ]
+    return [block]
+
+
+def _opens_question(block: BlockPlan, headings: set[int], source: dict[int, Segment]) -> bool:
+    if block.type != "section" or block.title or not block.blocks:
+        return False
+    first = block.blocks[0]
+    return first.type == "paragraph" and not first.keep_lines and next(_ids([first.segments], source), None) in headings
+
+
 def _same_series(head: Segment, other: Segment, *, after: bool) -> bool:
     """두 문항 제목이 번호가 하나 차이로 이어지고 글자 모양과 왼쪽 끝이 같은가. after면 other가 다음 문항이다."""
     a, b = (_NUMBERED.fullmatch(s.text.strip()) for s in (head, other))
@@ -1511,7 +1663,8 @@ def _recover_questions(
     if len(numbered) < 2:
         return blocks
     claimed = set(_ids(_plan_refs(title, blocks), source))
-    blocks = _name_untitled_questions(blocks, {segments[i].id for i in numbered}, source, claimed)
+    headings = {segments[i].id for i in numbered}
+    blocks = _name_untitled_questions(_unnest_questions(blocks, headings, source), headings, source, claimed)
     used = set(_ids(_plan_refs(title, blocks), source))
     for index in sorted(numbered):
         head = segments[index]

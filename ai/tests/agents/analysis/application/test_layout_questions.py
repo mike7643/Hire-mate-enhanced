@@ -112,3 +112,24 @@ def test_a_body_line_cut_mid_sentence_used_as_a_title_goes_back_to_the_text() ->
 def test_a_title_without_letters_or_digits_goes_back_to_the_text() -> None:
     shaped = _revise([(_BODY, 10.0), ("/**", 10.0), (" * 매일 실행하는 작업", 10.0)], _p("1"), _s(["2"], _p("3")))
     assert shaped == [["1"], ["2"], ["3"]]
+
+
+def test_questions_the_model_nested_inside_the_previous_question_come_back_out_as_siblings() -> None:
+    lines = [
+        ("1. 지원동기", 10.5),
+        (_BODY, 10.0),
+        ("2. 성장과정", 10.5),
+        (_BODY, 10.0),
+        ("3. 나의 장점과 약점", 10.5),
+        (_BODY, 10.0),
+        ("위의 내용은 사실과 틀림없음을 확인합니다.", 9.5),
+    ]
+    nested = _s(None, _p("1"), _p("2"), _s(None, _p("3"), _p("4"), _s(None, _p("5"), _p("6"))), _p("7"))
+    assert _revise(lines, nested) == [(["1"], [["2"]]), (["3"], [["4"]]), (["5"], [["6"]]), ["7"]]
+
+
+def test_a_short_lead_line_larger_than_the_rest_of_its_section_becomes_the_title() -> None:
+    lines = [("학력사항 (최종학력 : 대학교 졸업)", 9.5), (_BODY, 9.0), (_BODY, 9.0)]
+    assert _revise(lines, _s(None, _p("1"), _p("2-3"))) == [(["1"], [["2-3"]])]
+    same = [("학력사항 (최종학력 : 대학교 졸업)", 9.0), (_BODY, 9.0), (_BODY, 9.0)]
+    assert _revise(same, _s(None, _p("1"), _p("2-3"))) == [(None, [["1"], ["2-3"]])]
